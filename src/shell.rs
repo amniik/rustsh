@@ -1,5 +1,7 @@
 use std::io::{self, Write};
 
+mod execute;
+
 pub struct Shell {}
 
 impl Shell {
@@ -14,7 +16,9 @@ impl Shell {
                 break;
             };
             let args = self.parser(&cmd);
-            self.eval(&args);
+            if self.eval(&args) {
+                break;
+            }
         }
     }
 
@@ -36,11 +40,12 @@ impl Shell {
         command.split_whitespace().map(String::from).collect()
     }
 
-    fn eval(&self, args: &[String]) {
+    fn eval(&self, args: &[String]) -> bool {
         if args.is_empty() {
-            return;
+            return false;
         }
-        println!("{}: command not found", args[0])
+
+        execute::execute(args)
     }
 }
 
