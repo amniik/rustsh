@@ -16,6 +16,18 @@ fn test_repl() {
 }
 
 #[test]
+fn test_exit_command() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rustsh"))
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(b"exit\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success());
+}
+
+#[test]
 fn test_empty_input() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rustsh"))
         .stdin(Stdio::piped())
