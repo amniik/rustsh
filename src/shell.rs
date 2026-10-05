@@ -2,11 +2,15 @@ use std::io::{self, Write};
 
 mod execute;
 
-pub struct Shell {}
+pub struct Shell {
+    executer: execute::Executer,
+}
 
 impl Shell {
     pub fn new() -> Self {
-        Self {}
+        Self {
+            executer: execute::Executer::new(),
+        }
     }
 
     pub fn run(&mut self) {
@@ -45,7 +49,14 @@ impl Shell {
             return false;
         }
 
-        execute::execute(args)
+        match self.executer.execute(args) {
+            execute::ExecuteResult::Continue => false,
+            execute::ExecuteResult::Exit => true,
+            execute::ExecuteResult::NotFound => {
+                println!("{}: command not found", args[0]);
+                false
+            }
+        }
     }
 }
 
