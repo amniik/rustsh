@@ -2,6 +2,12 @@
 name = "rustsh"
 version = "0.1.0"
 edition = "2024"
+description = "A shell written in Rust."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/amniik/rustsh"
+keywords = ["shell", "unix", "linux", "rust"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 nix = { version = "0.31", features = ["process", "fs"] }
