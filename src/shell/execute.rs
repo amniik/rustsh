@@ -28,6 +28,7 @@ impl Executer {
                 ("echo", echo as Builtin),
                 ("type", type_cmd),
                 ("pwd", pwd),
+                ("cd", cd),
                 ("exit", exit),
             ]),
         }
@@ -102,6 +103,48 @@ fn pwd(_: &[String]) -> ExecuteResult {
     match env::current_dir() {
         Ok(path) => println!("{}", path.display()),
         Err(err) => eprintln!("pwd: {err}"),
+    }
+
+    ExecuteResult::Continue
+}
+
+fn cd(args: &[String]) -> ExecuteResult {
+    if args.len() > 1 {
+        eprintln!("cd: too many arguments");
+        return ExecuteResult::Continue;
+    }
+
+    let path = match args.first() {
+        None => match env::var_os("HOME") {
+            Some(home) => PathBuf::from(home),
+            None => {
+                eprintln!("cd: HOME not set");
+                return ExecuteResult::Continue;
+            }
+        },
+        Some(dir) if dir == "~" => match env::var_os("HOME") {
+            Some(home) => PathBuf::from(home),
+            None => {
+                eprintln!("cd: HOME not set");
+                return ExecuteResult::Continue;
+            }
+        },
+        Some(dir) if dir.starts_with("~/") => match env::var_os("HOME") {
+            Some(home) => {
+                let mut path = PathBuf::from(home);
+                path.push(&dir[2..]);
+                path
+            }
+            None => {
+                eprintln!("cd: HOME not set");
+                return ExecuteResult::Continue;
+            }
+        },
+        Some(dir) => PathBuf::from(dir),
+    };
+
+    if let Err(err) = env::set_current_dir(&path) {
+        eprintln!("cd: {}: {err}", path.display());
     }
 
     ExecuteResult::Continue
