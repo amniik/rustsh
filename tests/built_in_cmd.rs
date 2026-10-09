@@ -1,79 +1,34 @@
+mod common;
+
+use common::run_shell;
 use std::env;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
 #[test]
 fn test_echo_command() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rustsh"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(b"echo hello\n")
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    let stdout = String::from_utf8(output.stdout).unwrap();
+    let (stdout, _) = run_shell("echo hello\n");
 
     assert_eq!(stdout, "$ hello\n$ ");
 }
 
 #[test]
 fn test_type_builtin() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rustsh"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(b"type echo\n")
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    let stdout = String::from_utf8(output.stdout).unwrap();
+    let (stdout, _) = run_shell("type echo\n");
 
     assert!(stdout.contains("echo is a shell builtin"));
 }
 
 #[test]
 fn test_type_unknown_command() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rustsh"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(b"type hello\n")
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    let stdout = String::from_utf8(output.stdout).unwrap();
+    let (stdout, _) = run_shell("type hello\n");
 
     assert!(stdout.contains("hello: not found"));
 }
 
 #[test]
 fn test_type_external_command() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rustsh"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(b"type ls\n")
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    let stdout = String::from_utf8(output.stdout).unwrap();
+    let (stdout, _) = run_shell("type ls\n");
 
     assert!(stdout.contains("ls is /usr/bin/ls"));
 }
@@ -92,36 +47,10 @@ fn test_exit_command() {
 
 #[test]
 fn test_pwd_command() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rustsh"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.as_mut().unwrap().write_all(b"pwd\n").unwrap();
-    let output = child.wait_with_output().unwrap();
-    let stdout = String::from_utf8(output.stdout).unwrap();
+    let (stdout, _) = run_shell("pwd\n");
+
     let s = env::current_dir().unwrap().into_string().unwrap();
     assert!(stdout.contains(&s));
-}
-
-fn run_shell(commands: &str) -> (String, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rustsh"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(commands.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    (
-        String::from_utf8(output.stdout).unwrap(),
-        String::from_utf8(output.stderr).unwrap(),
-    )
 }
 
 #[test]
