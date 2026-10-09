@@ -27,6 +27,7 @@ impl Executer {
             builtin_commands: HashMap::from([
                 ("echo", echo as Builtin),
                 ("type", type_cmd),
+                ("pwd", pwd),
                 ("exit", exit),
             ]),
         }
@@ -94,6 +95,15 @@ fn exit(_: &[String]) -> ExecuteResult {
 
 fn echo(args: &[String]) -> ExecuteResult {
     println!("{}", args.join(" "));
+    ExecuteResult::Continue
+}
+
+fn pwd(_: &[String]) -> ExecuteResult {
+    match env::current_dir() {
+        Ok(path) => println!("{}", path.display()),
+        Err(err) => eprintln!("pwd: {err}"),
+    }
+
     ExecuteResult::Continue
 }
 
