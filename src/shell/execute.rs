@@ -9,6 +9,8 @@ use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::{env, os::unix::fs::PermissionsExt};
 
+use crate::shell::parser::Command;
+
 pub struct Executer {
     builtin_commands: HashMap<&'static str, Builtin>,
 }
@@ -34,18 +36,26 @@ impl Executer {
         }
     }
 
-    pub fn execute(&self, args: &[String]) -> ExecuteResult {
-        if let Some(command) = self.builtin_commands.get(args[0].as_str()) {
+    pub fn execute(&self, command: Command) -> ExecuteResult {
+        match command {
+            Command::SimpleCommand { args } => self.execute_simple_command(&args),
+        }
+    }
+
+    pub fn execute_simple_command(&self, args: &[String]) -> ExecuteResult {
+        let program = args.first().unwrap().as_str();
+        if let Some(command) = self.builtin_commands.get(program) {
             return command(&args[1..]);
         }
 
-        let executable = if args[0].contains('/') {
-            find_executable(args[0].as_str())
+        let executable = if program.contains('/') {
+            find_executable(program)
         } else {
-            find_executable_in_path(args[0].as_str())
+            find_executable_in_path(program)
         };
 
         let Some(executable) = executable else {
+            println!("{}: command not found", program);
             return ExecuteResult::NotFound;
         };
 
