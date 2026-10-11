@@ -1,15 +1,25 @@
 use std::io::{self, Write};
 
 mod execute;
+mod lexer;
+mod parser;
+
+use execute::Executer;
+use lexer::Tokenizer;
+use parser::Parser;
 
 pub struct Shell {
-    executer: execute::Executer,
+    tokenizer: Tokenizer,
+    parser: Parser,
+    executer: Executer,
 }
 
 impl Shell {
     pub fn new() -> Self {
         Self {
-            executer: execute::Executer::new(),
+            tokenizer: Tokenizer::new(),
+            parser: Parser::new(),
+            executer: Executer::new(),
         }
     }
 
@@ -19,8 +29,7 @@ impl Shell {
             let Some(cmd) = self.read_input() else {
                 break;
             };
-            let args = self.parser(&cmd);
-            if self.eval(&args) {
+            if self.eval(&cmd) {
                 break;
             }
         }
@@ -40,22 +49,21 @@ impl Shell {
         Some(command.trim().to_string())
     }
 
-    fn parser(&self, command: &str) -> Vec<String> {
-        command.split_whitespace().map(String::from).collect()
-    }
+    fn eval(&self, command: &str) -> bool {
+        let tokens = self.tokenizer.tokenize(command);
 
-    fn eval(&self, args: &[String]) -> bool {
-        if args.is_empty() {
+        if tokens.is_empty() {
             return false;
         }
 
-        match self.executer.execute(args) {
+        let Some(command) = self.parser.parse(tokens) else {
+            return false;
+        };
+
+        match self.executer.execute(command) {
             execute::ExecuteResult::Continue => false,
             execute::ExecuteResult::Exit => true,
-            execute::ExecuteResult::NotFound => {
-                println!("{}: command not found", args[0]);
-                false
-            }
+            execute::ExecuteResult::NotFound => false,
         }
     }
 }
