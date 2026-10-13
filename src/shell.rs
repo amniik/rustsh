@@ -50,20 +50,26 @@ impl Shell {
     }
 
     fn eval(&self, command: &str) -> bool {
-        let tokens = self.tokenizer.tokenize(command);
+        match self.tokenizer.tokenize(command) {
+            Err(e) => {
+                println!("{}", e);
+                false
+            }
+            Ok(tokens) => {
+                if tokens.is_empty() {
+                    return false;
+                }
 
-        if tokens.is_empty() {
-            return false;
-        }
+                let Some(command) = self.parser.parse(tokens) else {
+                    return false;
+                };
 
-        let Some(command) = self.parser.parse(tokens) else {
-            return false;
-        };
-
-        match self.executer.execute(command) {
-            execute::ExecuteResult::Continue => false,
-            execute::ExecuteResult::Exit => true,
-            execute::ExecuteResult::NotFound => false,
+                match self.executer.execute(command) {
+                    execute::ExecuteResult::Continue => false,
+                    execute::ExecuteResult::Exit => true,
+                    execute::ExecuteResult::NotFound => false,
+                }
+            }
         }
     }
 }
