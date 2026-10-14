@@ -59,15 +59,21 @@ impl Shell {
                 if tokens.is_empty() {
                     return false;
                 }
-
-                let Some(command) = self.parser.parse(tokens) else {
-                    return false;
-                };
-
-                match self.executer.execute(command) {
-                    execute::ExecuteResult::Continue => false,
-                    execute::ExecuteResult::Exit => true,
-                    execute::ExecuteResult::NotFound => false,
+                match self.parser.parse(tokens) {
+                    Err(e) => {
+                        println!("{}", e);
+                        false
+                    }
+                    Ok(command) => match self.executer.execute(command) {
+                        Err(e) => match e {
+                            execute::Error::Exit => true,
+                            _ => {
+                                eprintln!("{}", e);
+                                false
+                            }
+                        },
+                        Ok(()) => false,
+                    },
                 }
             }
         }

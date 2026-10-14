@@ -36,6 +36,7 @@ pub enum State {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Token {
     Word(String),
+    RedirectStdout,
 }
 
 pub struct Tokenizer;
@@ -72,6 +73,15 @@ impl Tokenizer {
                 (State::Normal, '\"') => {
                     state = State::DoubleQuoted;
                     word_started = true;
+                }
+
+                (State::Normal, '>') => {
+                    if word_started && token != "1" {
+                        tokens.push(Token::Word(std::mem::take(&mut token)));
+                    }
+                    tokens.push(Token::RedirectStdout);
+                    token.clear();
+                    word_started = false;
                 }
 
                 (State::NormalEscape, _) => {
@@ -311,5 +321,53 @@ mod tests {
             tokenizer().tokenize(r#"echo "hello\"#),
             Err(Error::Tokenizer(State::DoubleQuotedEscape))
         ));
+    }
+
+    #[test]
+    fn tokenize_stdout_redirection() {
+        assert_eq!(
+            tokenizer().tokenize("echo hello > file"),
+            Ok(vec![
+                Token::Word("echo".into()),
+                Token::Word("hello".into()),
+                Token::RedirectStdout,
+                Token::Word("file".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn tokenize_stdout_redirection_without_spaces() {
+        assert_eq!(
+            tokenizer().tokenize("echo hello>file"),
+            Ok(vec![
+                Token::Word("echo".into()),
+                Token::Word("hello".into()),
+                Token::RedirectStdout,
+                Token::Word("file".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn tokenize_escaped_redirection_character() {
+        assert_eq!(
+            tokenizer().tokenize(r"echo hello\>file"),
+            Ok(vec![
+                Token::Word("echo".into()),
+                Token::Word("hello>file".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn tokenize_redirection_character_inside_quotes() {
+        assert_eq!(
+            tokenizer().tokenize(r#"echo "hello>file""#),
+            Ok(vec![
+                Token::Word("echo".into()),
+                Token::Word("hello>file".into()),
+            ])
+        );
     }
 }
