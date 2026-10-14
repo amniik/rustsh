@@ -18,7 +18,8 @@ fn test_absolute_path_command() {
 
 #[test]
 fn test_command_not_found() {
-    let (stdout, _) = run_shell("does-not-exist\n");
+    let (stdout, stderr) = run_shell("does-not-exist\n");
 
-    assert_eq!(stdout, "$ does-not-exist: command not found\n$ ");
+    assert_eq!(stdout, "$ $ ");
+    assert_eq!(stderr, "does-not-exist: command not found\n");
 }

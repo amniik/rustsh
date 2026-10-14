@@ -1,4 +1,9 @@
+use crate::shell::parser::Command;
 use libc::_exit;
+use nix::fcntl::OFlag;
+use nix::fcntl::open;
+use nix::sys::stat::Mode;
+use nix::unistd::{dup, dup2_stdout};
 use nix::{
     errno::Errno,
     sys::wait::waitpid,
@@ -6,22 +11,54 @@ use nix::{
 };
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::fmt;
+use std::io::stdout;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::{env, os::unix::fs::PermissionsExt};
 
-use crate::shell::parser::Command;
+#[derive(Debug)]
+pub enum Error {
+    ArgsEmpty,
+    DupFailed(nix::Error),
+    StdoutRedirectionFailed(nix::Error),
+    FileStatusFailed(std::io::Error),
+    CommandNotFound(String),
+    WaitPidFailed(nix::Error),
+    ForkFailed(nix::Error),
+    Exit,
+    PwdFailed(std::io::Error),
+    CdFailed(String),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::ArgsEmpty => {
+                write!(f, "empty arguments passed to the executor")
+            }
+            Error::DupFailed(e) => write!(f, "dup failed: {e}"),
+            Error::StdoutRedirectionFailed(e) => {
+                write!(f, "stdout redirection failed: {e}")
+            }
+            Error::FileStatusFailed(e) => {
+                write!(f, "failed to obtain file status: {e}")
+            }
+            Error::CommandNotFound(command) => write!(f, "{}: command not found", command),
+            Error::WaitPidFailed(e) => write!(f, "waitpid failed: {e}"),
+            Error::ForkFailed(e) => write!(f, "fork failed: {e}"),
+            Error::Exit => Ok(()),
+            Error::PwdFailed(e) => write!(f, "pwd: {e}"),
+            Error::CdFailed(s) => write!(f, "cd: {s}"),
+        }
+    }
+}
 
 pub struct Executer {
     builtin_commands: HashMap<&'static str, Builtin>,
 }
 
-pub enum ExecuteResult {
-    Continue,
-    Exit,
-    NotFound,
-}
-
-type Builtin = fn(&[String]) -> ExecuteResult;
+type Builtin = fn(&[String]) -> Result<(), Error>;
 
 impl Executer {
     pub fn new() -> Self {
@@ -36,46 +73,69 @@ impl Executer {
         }
     }
 
-    pub fn execute(&self, command: Command) -> ExecuteResult {
+    pub fn execute(&self, command: Command) -> Result<(), Error> {
         match command {
-            Command::SimpleCommand { args } => self.execute_simple_command(&args),
+            Command::SimpleCommand { args, stdout } => self.execute_simple_command(&args, stdout),
         }
     }
 
-    pub fn execute_simple_command(&self, args: &[String]) -> ExecuteResult {
-        let program = args.first().unwrap().as_str();
-        if let Some(command) = self.builtin_commands.get(program) {
+    pub fn execute_simple_command(
+        &self,
+        args: &[String],
+        stdout: Option<String>,
+    ) -> Result<(), Error> {
+        let Some(program) = args.first() else {
+            return Err(Error::ArgsEmpty);
+        };
+        if let Some(command) = self.builtin_commands.get(program.as_str()) {
+            if let Some(path) = stdout {
+                let terminal_stdout = save_stdout()?;
+                redirect_stdout(&path)?;
+                let result = command(&args[1..]);
+                // Restore the Stdout
+                dup2_stdout(terminal_stdout).map_err(Error::DupFailed)?;
+                return result;
+            }
             return command(&args[1..]);
         }
-
-        let executable = if program.contains('/') {
-            find_executable(program)
-        } else {
-            find_executable_in_path(program)
-        };
-
-        let Some(executable) = executable else {
-            println!("{}: command not found", program);
-            return ExecuteResult::NotFound;
-        };
 
         match unsafe { fork() } {
             Ok(ForkResult::Parent { child, .. }) => {
                 if let Err(err) = waitpid(child, None) {
-                    eprintln!("waitpid failed: {err}");
+                    return Err(Error::WaitPidFailed(err));
                 }
             }
 
             Ok(ForkResult::Child) => {
+                if let Some(path) = stdout
+                    && let Err(err) = redirect_stdout(&path)
+                {
+                    eprintln!("{program}: {err}");
+                    unsafe {
+                        _exit(1);
+                    }
+                }
+                let executable = if program.contains('/') {
+                    find_executable(program)
+                } else {
+                    find_executable_in_path(program)
+                };
+
+                let Some(executable) = executable else {
+                    eprintln!("{}", Error::CommandNotFound(String::from(program)));
+                    unsafe {
+                        _exit(127);
+                    }
+                };
                 exec(executable.as_path(), args);
             }
 
             Err(err) => {
-                eprintln!("fork failed: {err}");
+                return Err(Error::ForkFailed(err));
             }
         }
 
-        ExecuteResult::Continue
+        Ok(())
     }
 }
 
@@ -100,43 +160,54 @@ fn exec(path: &Path, args: &[String]) {
     }
 }
 
-fn exit(_: &[String]) -> ExecuteResult {
-    ExecuteResult::Exit
+fn redirect_stdout(path: &str) -> Result<(), Error> {
+    let f = open(
+        path,
+        OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_CREAT | OFlag::O_TRUNC,
+        Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IROTH,
+    )
+    .map_err(Error::StdoutRedirectionFailed)?;
+    dup2_stdout(f).map_err(Error::DupFailed)
 }
 
-fn echo(args: &[String]) -> ExecuteResult {
+fn save_stdout() -> Result<OwnedFd, Error> {
+    dup(stdout()).map_err(Error::DupFailed)
+}
+
+fn exit(_: &[String]) -> Result<(), Error> {
+    Err(Error::Exit)
+}
+
+fn echo(args: &[String]) -> Result<(), Error> {
     println!("{}", args.join(" "));
-    ExecuteResult::Continue
+    Ok(())
 }
 
-fn pwd(_: &[String]) -> ExecuteResult {
+fn pwd(_: &[String]) -> Result<(), Error> {
     match env::current_dir() {
         Ok(path) => println!("{}", path.display()),
-        Err(err) => eprintln!("pwd: {err}"),
+        Err(err) => return Err(Error::PwdFailed(err)),
     }
 
-    ExecuteResult::Continue
+    Ok(())
 }
 
-fn cd(args: &[String]) -> ExecuteResult {
+fn cd(args: &[String]) -> Result<(), Error> {
     if args.len() > 1 {
-        eprintln!("cd: too many arguments");
-        return ExecuteResult::Continue;
+        return Err(Error::CdFailed(String::from("too many arguments")));
     }
 
     let path = match args.first() {
         None => match env::var_os("HOME") {
             Some(home) => PathBuf::from(home),
             None => {
-                eprintln!("cd: HOME not set");
-                return ExecuteResult::Continue;
+                return Err(Error::CdFailed(String::from("HOME not set")));
             }
         },
         Some(dir) if dir == "~" => match env::var_os("HOME") {
             Some(home) => PathBuf::from(home),
             None => {
-                eprintln!("cd: HOME not set");
-                return ExecuteResult::Continue;
+                return Err(Error::CdFailed(String::from("HOME not set")));
             }
         },
         Some(dir) if dir.starts_with("~/") => match env::var_os("HOME") {
@@ -146,8 +217,7 @@ fn cd(args: &[String]) -> ExecuteResult {
                 path
             }
             None => {
-                eprintln!("cd: HOME not set");
-                return ExecuteResult::Continue;
+                return Err(Error::CdFailed(String::from("HOME not set")));
             }
         },
         Some(dir) => PathBuf::from(dir),
@@ -157,10 +227,10 @@ fn cd(args: &[String]) -> ExecuteResult {
         eprintln!("cd: {}: {err}", path.display());
     }
 
-    ExecuteResult::Continue
+    Ok(())
 }
 
-fn type_cmd(args: &[String]) -> ExecuteResult {
+fn type_cmd(args: &[String]) -> Result<(), Error> {
     for arg in args {
         if is_builtin_commad(arg) {
             println!("{arg} is a shell builtin");
@@ -170,7 +240,7 @@ fn type_cmd(args: &[String]) -> ExecuteResult {
             println!("{}: not found", arg);
         }
     }
-    ExecuteResult::Continue
+    Ok(())
 }
 
 fn find_executable_in_path(name: &str) -> Option<PathBuf> {
@@ -179,7 +249,9 @@ fn find_executable_in_path(name: &str) -> Option<PathBuf> {
     for dir in env::split_paths(&path) {
         let candidate = dir.join(name);
 
-        if is_executable(&candidate) {
+        if let Ok(exist) = is_executable(&candidate)
+            && exist
+        {
             return Some(candidate);
         }
     }
@@ -189,19 +261,20 @@ fn find_executable_in_path(name: &str) -> Option<PathBuf> {
 
 fn find_executable(name: &str) -> Option<PathBuf> {
     let candidate = PathBuf::from(name);
-    if is_executable(&candidate) {
+    if let Ok(exist) = is_executable(&candidate)
+        && exist
+    {
         return Some(candidate);
     }
 
     None
 }
 
-fn is_executable(candidate: &Path) -> bool {
-    candidate.is_file()
-        && candidate
-            .metadata()
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
+fn is_executable(candidate: &Path) -> Result<bool, Error> {
+    candidate
+        .metadata()
+        .map(|m| m.permissions().mode() & 0o111 != 0)
+        .map_err(Error::FileStatusFailed)
 }
 
 fn is_builtin_commad(command: &str) -> bool {
