@@ -3,7 +3,7 @@ use libc::_exit;
 use nix::fcntl::OFlag;
 use nix::fcntl::open;
 use nix::sys::stat::Mode;
-use nix::unistd::{dup, dup2_stdout};
+use nix::unistd::{dup, dup2_stderr, dup2_stdout};
 use nix::{
     errno::Errno,
     sys::wait::waitpid,
@@ -12,7 +12,7 @@ use nix::{
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fmt;
-use std::io::stdout;
+use std::io::{stderr, stdout};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::{env, os::unix::fs::PermissionsExt};
@@ -22,6 +22,7 @@ pub enum Error {
     ArgsEmpty,
     DupFailed(nix::Error),
     StdoutRedirectionFailed(nix::Error),
+    StderrRedirectionFailed(nix::Error),
     FileStatusFailed(std::io::Error),
     CommandNotFound(String),
     WaitPidFailed(nix::Error),
@@ -40,6 +41,9 @@ impl fmt::Display for Error {
             Error::DupFailed(e) => write!(f, "dup failed: {e}"),
             Error::StdoutRedirectionFailed(e) => {
                 write!(f, "stdout redirection failed: {e}")
+            }
+            Error::StderrRedirectionFailed(e) => {
+                write!(f, "stderr redirection failed: {e}")
             }
             Error::FileStatusFailed(e) => {
                 write!(f, "failed to obtain file status: {e}")
@@ -75,7 +79,11 @@ impl Executer {
 
     pub fn execute(&self, command: Command) -> Result<(), Error> {
         match command {
-            Command::SimpleCommand { args, stdout } => self.execute_simple_command(&args, stdout),
+            Command::SimpleCommand {
+                args,
+                stdout,
+                stderr,
+            } => self.execute_simple_command(&args, stdout, stderr),
         }
     }
 
@@ -83,20 +91,32 @@ impl Executer {
         &self,
         args: &[String],
         stdout: Option<String>,
+        stderr: Option<String>,
     ) -> Result<(), Error> {
         let Some(program) = args.first() else {
             return Err(Error::ArgsEmpty);
         };
         if let Some(command) = self.builtin_commands.get(program.as_str()) {
+            let mut terminal_stdout: Option<OwnedFd> = None;
+            let mut terminal_stderr: Option<OwnedFd> = None;
             if let Some(path) = stdout {
-                let terminal_stdout = save_stdout()?;
+                terminal_stdout = Some(save_stdout()?);
                 redirect_stdout(&path)?;
-                let result = command(&args[1..]);
-                // Restore the Stdout
-                dup2_stdout(terminal_stdout).map_err(Error::DupFailed)?;
-                return result;
             }
-            return command(&args[1..]);
+            if let Some(path) = stderr {
+                terminal_stderr = Some(save_stderr()?);
+                redirect_stderr(&path)?;
+            }
+            let result = command(&args[1..]);
+            if let Some(out) = terminal_stdout {
+                // Restore the Stdout
+                dup2_stdout(out).map_err(Error::DupFailed)?;
+            }
+            if let Some(err) = terminal_stderr {
+                // Restore the Stdout
+                dup2_stderr(err).map_err(Error::DupFailed)?;
+            }
+            return result;
         }
 
         match unsafe { fork() } {
@@ -109,6 +129,14 @@ impl Executer {
             Ok(ForkResult::Child) => {
                 if let Some(path) = stdout
                     && let Err(err) = redirect_stdout(&path)
+                {
+                    eprintln!("{program}: {err}");
+                    unsafe {
+                        _exit(1);
+                    }
+                }
+                if let Some(path) = stderr
+                    && let Err(err) = redirect_stderr(&path)
                 {
                     eprintln!("{program}: {err}");
                     unsafe {
@@ -172,6 +200,20 @@ fn redirect_stdout(path: &str) -> Result<(), Error> {
 
 fn save_stdout() -> Result<OwnedFd, Error> {
     dup(stdout()).map_err(Error::DupFailed)
+}
+
+fn redirect_stderr(path: &str) -> Result<(), Error> {
+    let f = open(
+        path,
+        OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_CREAT | OFlag::O_TRUNC,
+        Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IROTH,
+    )
+    .map_err(Error::StderrRedirectionFailed)?;
+    dup2_stderr(f).map_err(Error::DupFailed)
+}
+
+fn save_stderr() -> Result<OwnedFd, Error> {
+    dup(stderr()).map_err(Error::DupFailed)
 }
 
 fn exit(_: &[String]) -> Result<(), Error> {
