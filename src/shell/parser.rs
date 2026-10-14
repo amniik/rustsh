@@ -6,6 +6,7 @@ pub struct Parser;
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     StdoutNotFound,
+    StderrNotFound,
     TokensIsEmpty,
 }
 
@@ -13,6 +14,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::StdoutNotFound => write!(f, "Stdout is not found for redirection"),
+            Error::StderrNotFound => write!(f, "Stderr is not found for redirection"),
             Error::TokensIsEmpty => write!(f, "Tokens passed to parser is empty"),
         }
     }
@@ -23,6 +25,7 @@ pub enum Command {
     SimpleCommand {
         args: Vec<String>,
         stdout: Option<String>,
+        stderr: Option<String>,
     },
 }
 
@@ -36,21 +39,38 @@ impl Parser {
             return Err(Error::TokensIsEmpty);
         }
 
+        let mut expecting_stderr = false;
         let mut expecting_stdout = false;
         let mut args: Vec<String> = Vec::new();
         let mut stdout = None;
+        let mut stderr = None;
         for token in tokens.into_iter() {
             match token {
                 Token::RedirectStdout => {
                     if expecting_stdout {
                         return Err(Error::StdoutNotFound);
                     }
-                    expecting_stdout = true
+                    if expecting_stderr {
+                        return Err(Error::StderrNotFound);
+                    }
+                    expecting_stdout = true;
+                }
+                Token::RedirectStderr => {
+                    if expecting_stdout {
+                        return Err(Error::StdoutNotFound);
+                    }
+                    if expecting_stderr {
+                        return Err(Error::StderrNotFound);
+                    }
+                    expecting_stderr = true;
                 }
                 Token::Word(word) => {
                     if expecting_stdout {
                         stdout = Some(word);
                         expecting_stdout = false;
+                    } else if expecting_stderr {
+                        stderr = Some(word);
+                        expecting_stderr = false;
                     } else {
                         args.push(word);
                     }
@@ -59,8 +79,14 @@ impl Parser {
         }
         if expecting_stdout {
             Err(Error::StdoutNotFound)
+        } else if expecting_stderr {
+            Err(Error::StderrNotFound)
         } else {
-            Ok(Command::SimpleCommand { args, stdout })
+            Ok(Command::SimpleCommand {
+                args,
+                stdout,
+                stderr,
+            })
         }
     }
 }
@@ -85,7 +111,7 @@ mod tests {
 
         assert!(matches!(
             command,
-            Ok(Command::SimpleCommand { args, stdout: None })
+            Ok(Command::SimpleCommand { args, stdout: None, stderr: None })
                 if args == vec!["pwd"]
         ));
     }
@@ -103,7 +129,7 @@ mod tests {
 
         assert!(matches!(
             command,
-            Ok(Command::SimpleCommand { args, stdout: None })
+            Ok(Command::SimpleCommand { args, stdout: None, stderr: None })
                 if args == vec!["echo", "hello", "world"]
         ));
     }
@@ -117,7 +143,7 @@ mod tests {
 
         assert!(matches!(
             command,
-            Ok(Command::SimpleCommand { args, stdout: None })
+            Ok(Command::SimpleCommand { args, stdout: None, stderr: None })
                 if args == vec!["echo", ""]
         ));
     }
@@ -136,7 +162,7 @@ mod tests {
 
         assert!(matches!(
             command,
-            Ok(Command::SimpleCommand { args, stdout: None })
+            Ok(Command::SimpleCommand { args, stdout: None, stderr: None })
                 if args == vec!["command", "first", "second", "third"]
         ));
     }
@@ -155,7 +181,7 @@ mod tests {
 
         assert!(matches!(
             command,
-            Ok(Command::SimpleCommand { args, stdout: Some(stdout) })
+            Ok(Command::SimpleCommand { args, stdout: Some(stdout), stderr:None })
                 if args == vec!["echo", "hello"] && stdout == "out.txt"
         ));
     }
@@ -187,8 +213,55 @@ mod tests {
 
         assert!(matches!(
             command,
-            Ok(Command::SimpleCommand { args, stdout: Some(stdout) })
+            Ok(Command::SimpleCommand { args, stdout: Some(stdout), stderr: None })
                 if args == vec!["echo", "hello", "world"] && stdout == "out.txt"
+        ));
+    }
+
+    #[test]
+    fn test_stderr_redirection() {
+        let tokens = vec![
+            Token::Word("echo".into()),
+            Token::Word("error".into()),
+            Token::RedirectStderr,
+            Token::Word("error.txt".into()),
+        ];
+
+        let command = Parser.parse(tokens).unwrap();
+
+        assert!(matches!(
+            command,
+            Command::SimpleCommand { args, stdout: None, stderr: Some(path) }
+                if args == vec!["echo", "error"] && path == "error.txt"
+        ));
+    }
+
+    #[test]
+    fn test_stderr_redirection_without_filename() {
+        let tokens = vec![Token::Word("echo".into()), Token::RedirectStderr];
+
+        assert!(matches!(Parser.parse(tokens), Err(Error::StderrNotFound)));
+    }
+
+    #[test]
+    fn test_stdout_and_stderr_redirection() {
+        let tokens = vec![
+            Token::Word("echo".into()),
+            Token::Word("hello".into()),
+            Token::RedirectStdout,
+            Token::Word("output.txt".into()),
+            Token::RedirectStderr,
+            Token::Word("error.txt".into()),
+        ];
+
+        let command = Parser.parse(tokens).unwrap();
+
+        assert!(matches!(
+            command,
+            Command::SimpleCommand { args, stdout: Some(out), stderr: Some(err) }
+                if args == vec!["echo", "hello"]
+                    && out == "output.txt"
+                    && err == "error.txt"
         ));
     }
 }

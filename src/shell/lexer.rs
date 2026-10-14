@@ -37,6 +37,7 @@ pub enum State {
 pub enum Token {
     Word(String),
     RedirectStdout,
+    RedirectStderr,
 }
 
 pub struct Tokenizer;
@@ -76,10 +77,14 @@ impl Tokenizer {
                 }
 
                 (State::Normal, '>') => {
-                    if word_started && token != "1" {
+                    if word_started && token != "1" && token != "2" {
                         tokens.push(Token::Word(std::mem::take(&mut token)));
                     }
-                    tokens.push(Token::RedirectStdout);
+                    if token == "2" {
+                        tokens.push(Token::RedirectStderr);
+                    } else {
+                        tokens.push(Token::RedirectStdout);
+                    }
                     token.clear();
                     word_started = false;
                 }
