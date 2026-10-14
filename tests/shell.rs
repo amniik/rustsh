@@ -3,6 +3,7 @@ mod common;
 use common::run_shell;
 use std::io::Write;
 use std::process::{Command, Stdio};
+use tempfile::tempdir;
 
 #[test]
 fn test_empty_input() {
@@ -19,7 +20,7 @@ fn test_empty_input() {
 
 #[test]
 fn test_stdout_redirection() {
-    let temp_dir = tempfile::tempdir().unwrap();
+    let temp_dir = tempdir().unwrap();
     let output_file = temp_dir.path().join("output.txt");
 
     let input = format!("echo hello > {}\n", output_file.display());
@@ -32,7 +33,7 @@ fn test_stdout_redirection() {
 
 #[test]
 fn test_stdout_redirection_truncates_file() {
-    let temp_dir = tempfile::tempdir().unwrap();
+    let temp_dir = tempdir().unwrap();
     let output_file = temp_dir.path().join("output.txt");
 
     std::fs::write(&output_file, "old content\n").unwrap();
@@ -46,7 +47,7 @@ fn test_stdout_redirection_truncates_file() {
 
 #[test]
 fn test_command_not_found_with_stdout_redirection() {
-    let temp_dir = tempfile::tempdir().unwrap();
+    let temp_dir = tempdir().unwrap();
     let output_file = temp_dir.path().join("output.txt");
 
     let input = format!("does-not-exist > {}\n", output_file.display());
@@ -59,7 +60,7 @@ fn test_command_not_found_with_stdout_redirection() {
 
 #[test]
 fn test_builtin_stdout_restored_after_redirection() {
-    let temp_dir = tempfile::tempdir().unwrap();
+    let temp_dir = tempdir().unwrap();
     let output_file = temp_dir.path().join("output.txt");
 
     let input = format!(
@@ -74,4 +75,68 @@ fn test_builtin_stdout_restored_after_redirection() {
         std::fs::read_to_string(&output_file).unwrap(),
         "redirected\n"
     );
+}
+
+#[test]
+fn test_stderr_redirection() {
+    let temp_dir = tempdir().unwrap();
+    let error_file = temp_dir.path().join("error.txt");
+
+    let input = format!("sh -c 'echo error >&2' 2> {}\n", error_file.display());
+    let (stdout, stderr) = run_shell(&input);
+
+    assert_eq!(stdout, "$ $ ");
+    assert_eq!(stderr, "");
+    assert_eq!(std::fs::read_to_string(&error_file).unwrap(), "error\n");
+}
+
+#[test]
+fn test_stdout_and_stderr_redirection() {
+    let temp_dir = tempdir().unwrap();
+    let output_file = temp_dir.path().join("output.txt");
+    let error_file = temp_dir.path().join("error.txt");
+
+    let input = format!(
+        "sh -c 'echo output; echo error >&2' > {} 2> {}\n",
+        output_file.display(),
+        error_file.display()
+    );
+    let (stdout, stderr) = run_shell(&input);
+
+    assert_eq!(stdout, "$ $ ");
+    assert_eq!(stderr, "");
+    assert_eq!(std::fs::read_to_string(&output_file).unwrap(), "output\n");
+    assert_eq!(std::fs::read_to_string(&error_file).unwrap(), "error\n");
+}
+
+#[test]
+fn test_command_not_found_with_stderr_redirection() {
+    let temp_dir = tempdir().unwrap();
+    let error_file = temp_dir.path().join("error.txt");
+
+    let input = format!("does-not-exist 2> {}\n", error_file.display());
+    let (stdout, stderr) = run_shell(&input);
+
+    assert_eq!(stdout, "$ $ ");
+    assert_eq!(stderr, "");
+    assert_eq!(
+        std::fs::read_to_string(&error_file).unwrap(),
+        "does-not-exist: command not found\n"
+    );
+}
+
+#[test]
+fn test_builtin_stderr_restored_after_redirection() {
+    let temp_dir = tempdir().unwrap();
+    let error_file = temp_dir.path().join("error.txt");
+
+    let input = format!(
+        "cd /nonexistent-directory 2> {}\necho terminal\n",
+        error_file.display()
+    );
+    let (stdout, stderr) = run_shell(&input);
+
+    assert!(stdout.contains("terminal\n"));
+    assert_eq!(stderr, "");
+    assert!(!std::fs::read_to_string(&error_file).unwrap().is_empty());
 }
