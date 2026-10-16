@@ -1,3 +1,4 @@
+use crate::shell::parser;
 use crate::shell::parser::Command;
 use libc::_exit;
 use nix::fcntl::OFlag;
@@ -90,8 +91,8 @@ impl Executer {
     pub fn execute_simple_command(
         &self,
         args: &[String],
-        stdout: Option<String>,
-        stderr: Option<String>,
+        stdout: Option<parser::StdStatus>,
+        stderr: Option<parser::StdStatus>,
     ) -> Result<(), Error> {
         let Some(program) = args.first() else {
             return Err(Error::ArgsEmpty);
@@ -99,13 +100,13 @@ impl Executer {
         if let Some(command) = self.builtin_commands.get(program.as_str()) {
             let mut terminal_stdout: Option<OwnedFd> = None;
             let mut terminal_stderr: Option<OwnedFd> = None;
-            if let Some(path) = stdout {
+            if let Some(std) = stdout {
                 terminal_stdout = Some(save_stdout()?);
-                redirect_stdout(&path)?;
+                redirect_stdout(&std)?;
             }
-            if let Some(path) = stderr {
+            if let Some(std) = stderr {
                 terminal_stderr = Some(save_stderr()?);
-                redirect_stderr(&path)?;
+                redirect_stderr(&std)?;
             }
             let result = command(&args[1..]);
             if let Some(out) = terminal_stdout {
@@ -127,16 +128,16 @@ impl Executer {
             }
 
             Ok(ForkResult::Child) => {
-                if let Some(path) = stdout
-                    && let Err(err) = redirect_stdout(&path)
+                if let Some(std) = stdout
+                    && let Err(err) = redirect_stdout(&std)
                 {
                     eprintln!("{program}: {err}");
                     unsafe {
                         _exit(1);
                     }
                 }
-                if let Some(path) = stderr
-                    && let Err(err) = redirect_stderr(&path)
+                if let Some(std) = stderr
+                    && let Err(err) = redirect_stderr(&std)
                 {
                     eprintln!("{program}: {err}");
                     unsafe {
@@ -188,10 +189,16 @@ fn exec(path: &Path, args: &[String]) {
     }
 }
 
-fn redirect_stdout(path: &str) -> Result<(), Error> {
+fn redirect_stdout(std: &parser::StdStatus) -> Result<(), Error> {
+    let parser::StdStatus { path, append } = std;
+    let flag = if *append {
+        OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_CREAT | OFlag::O_APPEND
+    } else {
+        OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_CREAT | OFlag::O_TRUNC
+    };
     let f = open(
-        path,
-        OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_CREAT | OFlag::O_TRUNC,
+        path.as_str(),
+        flag,
         Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IROTH,
     )
     .map_err(Error::StdoutRedirectionFailed)?;
@@ -202,10 +209,16 @@ fn save_stdout() -> Result<OwnedFd, Error> {
     dup(stdout()).map_err(Error::DupFailed)
 }
 
-fn redirect_stderr(path: &str) -> Result<(), Error> {
+fn redirect_stderr(std: &parser::StdStatus) -> Result<(), Error> {
+    let parser::StdStatus { path, append } = std;
+    let flag = if *append {
+        OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_CREAT | OFlag::O_APPEND
+    } else {
+        OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_CREAT | OFlag::O_TRUNC
+    };
     let f = open(
-        path,
-        OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_CREAT | OFlag::O_TRUNC,
+        path.as_str(),
+        flag,
         Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IROTH,
     )
     .map_err(Error::StderrRedirectionFailed)?;

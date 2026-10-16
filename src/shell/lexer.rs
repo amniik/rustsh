@@ -36,8 +36,9 @@ pub enum State {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Token {
     Word(String),
-    RedirectStdout,
-    RedirectStderr,
+    // use bool value as appending check
+    RedirectStdout(bool),
+    RedirectStderr(bool),
 }
 
 pub struct Tokenizer;
@@ -52,8 +53,9 @@ impl Tokenizer {
         let mut token = String::new();
         let mut state = State::Normal;
         let mut word_started = false;
+        let mut chars = input.chars().peekable();
 
-        for ch in input.chars() {
+        while let Some(ch) = chars.next() {
             match (&state, ch) {
                 (State::Normal, ' ' | '\t') => {
                     if word_started {
@@ -77,13 +79,25 @@ impl Tokenizer {
                 }
 
                 (State::Normal, '>') => {
-                    if word_started && token != "1" && token != "2" {
+                    let fd = if word_started {
+                        match token.as_str() {
+                            "1" => Some(1),
+                            "2" => Some(2),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if fd.is_none() && word_started {
                         tokens.push(Token::Word(std::mem::take(&mut token)));
                     }
-                    if token == "2" {
-                        tokens.push(Token::RedirectStderr);
-                    } else {
-                        tokens.push(Token::RedirectStdout);
+                    let append = chars.peek() == Some(&'>');
+                    if append {
+                        chars.next();
+                    }
+                    match fd {
+                        Some(2) => tokens.push(Token::RedirectStderr(append)),
+                        _ => tokens.push(Token::RedirectStdout(append)),
                     }
                     token.clear();
                     word_started = false;
@@ -335,9 +349,26 @@ mod tests {
             Ok(vec![
                 Token::Word("echo".into()),
                 Token::Word("hello".into()),
-                Token::RedirectStdout,
+                Token::RedirectStdout(false),
                 Token::Word("file".into()),
             ])
+        );
+    }
+
+    #[test]
+    fn tokenize_stdout_append_redirection() {
+        let tokenizer = Tokenizer::new();
+
+        let tokens = tokenizer.tokenize("echo hello >> out.txt").unwrap();
+
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Word("echo".to_string()),
+                Token::Word("hello".to_string()),
+                Token::RedirectStdout(true),
+                Token::Word("out.txt".to_string()),
+            ]
         );
     }
 
@@ -348,7 +379,7 @@ mod tests {
             Ok(vec![
                 Token::Word("echo".into()),
                 Token::Word("hello".into()),
-                Token::RedirectStdout,
+                Token::RedirectStdout(false),
                 Token::Word("file".into()),
             ])
         );
@@ -373,6 +404,40 @@ mod tests {
                 Token::Word("echo".into()),
                 Token::Word("hello>file".into()),
             ])
+        );
+    }
+
+    #[test]
+    fn tokenize_stderr_redirection() {
+        let tokenizer = Tokenizer::new();
+
+        let tokens = tokenizer.tokenize("echo hello 2> error.txt").unwrap();
+
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Word("echo".to_string()),
+                Token::Word("hello".to_string()),
+                Token::RedirectStderr(false),
+                Token::Word("error.txt".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_stderr_append_redirection() {
+        let tokenizer = Tokenizer::new();
+
+        let tokens = tokenizer.tokenize("echo hello 2>> error.txt").unwrap();
+
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Word("echo".to_string()),
+                Token::Word("hello".to_string()),
+                Token::RedirectStderr(true),
+                Token::Word("error.txt".to_string()),
+            ]
         );
     }
 }
