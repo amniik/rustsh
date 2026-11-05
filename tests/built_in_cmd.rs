@@ -49,7 +49,11 @@ fn test_exit_command() {
 fn test_pwd_command() {
     let (stdout, _) = run_shell("pwd\n");
 
-    let s = env::current_dir().unwrap().into_string().unwrap();
+    let s = env::current_dir()
+        .unwrap()
+        .into_os_string()
+        .into_string()
+        .unwrap();
     assert!(stdout.contains(&s));
 }
 
