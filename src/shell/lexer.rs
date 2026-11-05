@@ -39,6 +39,7 @@ pub enum Token {
     // use bool value as appending check
     RedirectStdout(bool),
     RedirectStderr(bool),
+    Ampersand,
 }
 
 pub struct Tokenizer;
@@ -59,7 +60,10 @@ impl Tokenizer {
             match (&state, ch) {
                 (State::Normal, ' ' | '\t') => {
                     if word_started {
-                        tokens.push(Token::Word(std::mem::take(&mut token)));
+                        match token.as_str() {
+                            "&" => tokens.push(Token::Ampersand),
+                            _ => tokens.push(Token::Word(std::mem::take(&mut token))),
+                        };
                         word_started = false;
                     }
                 }
@@ -143,7 +147,10 @@ impl Tokenizer {
         }
 
         if word_started {
-            tokens.push(Token::Word(token));
+            match token.as_str() {
+                "&" => tokens.push(Token::Ampersand),
+                _ => tokens.push(Token::Word(token)),
+            };
         }
 
         Ok(tokens)

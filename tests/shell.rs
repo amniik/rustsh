@@ -140,3 +140,20 @@ fn test_builtin_stderr_restored_after_redirection() {
     assert_eq!(stderr, "");
     assert!(!std::fs::read_to_string(&error_file).unwrap().is_empty());
 }
+
+#[test]
+fn test_background_job() {
+    let input = "sleep 2 >/dev/null 2>&1 &\n";
+    let start = std::time::Instant::now();
+
+    let (stdout, stderr) = run_shell(input);
+
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(1),
+        "background job blocked the shell"
+    );
+
+    assert!(stdout.starts_with("$ [1] "));
+    assert!(stdout.ends_with("\n$ "));
+    assert_eq!(stderr, "");
+}

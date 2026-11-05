@@ -1,5 +1,6 @@
 use std::io::{self, Write};
 
+mod command;
 mod execute;
 mod lexer;
 mod parser;
@@ -19,12 +20,13 @@ impl Shell {
         Self {
             tokenizer: Tokenizer::new(),
             parser: Parser::new(),
-            executer: Executer::new(),
+            executer: Executer::new().unwrap(),
         }
     }
 
     pub fn run(&mut self) {
         loop {
+            self.executer.check_background_jobs();
             self.print_prompt();
             let Some(cmd) = self.read_input() else {
                 break;
@@ -49,7 +51,7 @@ impl Shell {
         Some(command.trim().to_string())
     }
 
-    fn eval(&self, command: &str) -> bool {
+    fn eval(&mut self, command: &str) -> bool {
         match self.tokenizer.tokenize(command) {
             Err(e) => {
                 println!("{}", e);
