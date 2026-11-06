@@ -1,5 +1,6 @@
 use std::io::{self, Write};
 
+mod command;
 mod execute;
 mod lexer;
 mod parser;
@@ -19,7 +20,7 @@ impl Shell {
         Self {
             tokenizer: Tokenizer::new(),
             parser: Parser::new(),
-            executer: Executer::new(),
+            executer: Executer::new().unwrap(),
         }
     }
 

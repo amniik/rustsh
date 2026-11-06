@@ -10,7 +10,7 @@ keywords = ["shell", "unix", "linux", "rust"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-nix = { version = "0.31", features = ["process", "fs"] }
+nix = { version = "0.31", features = ["process", "term", "fs", "signal"] }
 libc = "0.2"
 
 [dev-dependencies]
