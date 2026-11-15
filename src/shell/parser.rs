@@ -1,4 +1,4 @@
-use crate::shell::command::{Command, Job, ProcessGroup, StdStatus};
+use crate::shell::command::{Command, Job, ProcessGroup, SimpleCommand, StdStream};
 use crate::shell::lexer::Token;
 use std::fmt;
 
@@ -9,6 +9,7 @@ pub enum Error {
     StdoutNotFound,
     StderrNotFound,
     TokensIsEmpty,
+    InCompletePipe,
 }
 
 impl fmt::Display for Error {
@@ -17,6 +18,7 @@ impl fmt::Display for Error {
             Error::StdoutNotFound => write!(f, "Stdout is not found for redirection"),
             Error::StderrNotFound => write!(f, "Stderr is not found for redirection"),
             Error::TokensIsEmpty => write!(f, "Tokens passed to parser is empty"),
+            Error::InCompletePipe => write!(f, "pipe is incomplete"),
         }
     }
 }
@@ -34,11 +36,14 @@ impl Parser {
         let mut expecting_stderr = false;
         let mut expecting_stdout = false;
         let mut args: Vec<String> = Vec::new();
-        let mut stdout = None;
+        let mut sout = StdStream::Terminal;
         let mut std_out_append = false;
         let mut std_err_append = false;
-        let mut stderr = None;
+        let mut serr = StdStream::Terminal;
+        let mut sin = StdStream::Terminal;
         let mut pg = ProcessGroup::Foreground;
+        let mut commands = Vec::new();
+        let mut is_pipeline = false;
         for token in tokens.into_iter() {
             match token {
                 Token::RedirectStdout(append) => {
@@ -63,16 +68,16 @@ impl Parser {
                 }
                 Token::Word(word) => {
                     if expecting_stdout {
-                        stdout = Some(StdStatus {
+                        sout = StdStream::File {
                             path: word,
                             append: std_out_append,
-                        });
+                        };
                         expecting_stdout = false;
                     } else if expecting_stderr {
-                        stderr = Some(StdStatus {
+                        serr = StdStream::File {
                             path: word,
                             append: std_err_append,
-                        });
+                        };
                         expecting_stderr = false;
                     } else {
                         args.push(word);
@@ -81,6 +86,21 @@ impl Parser {
                 Token::Ampersand => {
                     pg = ProcessGroup::Background;
                 }
+                Token::Pipe => {
+                    is_pipeline = true;
+                    if expecting_stdout {
+                        return Err(Error::StdoutNotFound);
+                    } else if expecting_stderr {
+                        return Err(Error::StderrNotFound);
+                    } else {
+                        commands.push(SimpleCommand {
+                            args: std::mem::take(&mut args),
+                            serr: std::mem::take(&mut serr),
+                            sin: std::mem::take(&mut sin),
+                            sout: std::mem::take(&mut sout),
+                        });
+                    }
+                }
             }
         }
         if expecting_stdout {
@@ -88,14 +108,27 @@ impl Parser {
         } else if expecting_stderr {
             Err(Error::StderrNotFound)
         } else {
-            Ok(Job::new(
-                Command::SimpleCommand {
-                    args,
-                    stdout,
-                    stderr,
-                },
-                pg,
-            ))
+            if is_pipeline && !args.is_empty() {
+                commands.push(SimpleCommand {
+                    args: std::mem::take(&mut args),
+                    serr: std::mem::take(&mut serr),
+                    sin: std::mem::take(&mut sin),
+                    sout: std::mem::take(&mut sout),
+                });
+                Ok(Job::new(Command::Pipeline(commands), pg))
+            } else if is_pipeline {
+                Err(Error::InCompletePipe)
+            } else {
+                Ok(Job::new(
+                    Command::Simple(SimpleCommand {
+                        args: std::mem::take(&mut args),
+                        serr: std::mem::take(&mut serr),
+                        sin: std::mem::take(&mut sin),
+                        sout: std::mem::take(&mut sout),
+                    }),
+                    pg,
+                ))
+            }
         }
     }
 }
@@ -118,21 +151,26 @@ mod tests {
             return false;
         };
 
-        let Command::SimpleCommand {
-            args,
-            stdout,
-            stderr,
-        } = job.get_command();
+        let Command::Simple(SimpleCommand {
+            args, sout, serr, ..
+        }) = job.get_command()
+        else {
+            return false;
+        };
 
-        let stdout_matches = match (stdout, expected_stdout) {
-            (None, None) => true,
-            (Some(actual), Some((path, append))) => actual.path == path && actual.append == append,
+        let stdout_matches = match (sout, expected_stdout) {
+            (StdStream::Terminal, None) => true,
+            (StdStream::File { path, append }, Some((expected_path, expected_append))) => {
+                path == expected_path && *append == expected_append
+            }
             _ => false,
         };
 
-        let stderr_matches = match (stderr, expected_stderr) {
-            (None, None) => true,
-            (Some(actual), Some((path, append))) => actual.path == path && actual.append == append,
+        let stderr_matches = match (serr, expected_stderr) {
+            (StdStream::Terminal, None) => true,
+            (StdStream::File { path, append }, Some((expected_path, expected_append))) => {
+                path == expected_path && *append == expected_append
+            }
             _ => false,
         };
 
@@ -362,7 +400,8 @@ mod tests {
 
         assert!(matches!(
             result.get_command(),
-            Command::SimpleCommand { args, .. } if args == &["sleep", "10"]
+            Command::Simple(SimpleCommand { args, .. })
+                if args == &["sleep", "10"]
         ));
     }
 }
