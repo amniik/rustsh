@@ -40,6 +40,7 @@ pub enum Token {
     RedirectStdout(bool),
     RedirectStderr(bool),
     Ampersand,
+    Pipe,
 }
 
 pub struct Tokenizer;
@@ -103,6 +104,15 @@ impl Tokenizer {
                         Some(2) => tokens.push(Token::RedirectStderr(append)),
                         _ => tokens.push(Token::RedirectStdout(append)),
                     }
+                    token.clear();
+                    word_started = false;
+                }
+
+                (State::Normal, '|') => {
+                    if !token.is_empty() && word_started {
+                        tokens.push(Token::Word(std::mem::take(&mut token)));
+                    }
+                    tokens.push(Token::Pipe);
                     token.clear();
                     word_started = false;
                 }

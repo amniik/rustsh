@@ -2,6 +2,7 @@ use nix::errno::Errno;
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 use std::fmt;
+use std::os::fd::BorrowedFd;
 
 #[derive(Debug)]
 pub enum Error {
@@ -22,28 +23,77 @@ impl fmt::Display for Error {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct StdStatus {
-    pub path: String,
-    pub append: bool,
+#[derive(Debug, Default)]
+pub enum StdStream {
+    File {
+        path: String,
+        append: bool,
+    },
+    #[default]
+    Terminal,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+pub enum RuntimeStream<'a> {
+    Configured(&'a StdStream),
+    Pipe(BorrowedFd<'a>),
+}
+
+#[derive(Debug)]
 pub enum Command {
-    SimpleCommand {
-        args: Vec<String>,
-        stdout: Option<StdStatus>,
-        stderr: Option<StdStatus>,
-    },
+    Simple(SimpleCommand),
+    Pipeline(Vec<SimpleCommand>),
+}
+
+#[derive(Debug)]
+pub struct SimpleCommand {
+    pub args: Vec<String>,
+    pub sout: StdStream,
+    pub serr: StdStream,
+    pub sin: StdStream,
 }
 
 impl fmt::Display for Command {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Command::SimpleCommand { args, .. } => {
-                write!(f, "{}", args.join(" "))
+            Command::Simple(command) => {
+                write!(f, "{}", command.args.join(" "))
+            }
+            Command::Pipeline(commands) => {
+                let pipeline = commands
+                    .iter()
+                    .map(|command| command.args.join(" "))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+
+                write!(f, "{pipeline}")
             }
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct Process {
+    pid: Pid,
+    state: ProcessState,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ProcessState {
+    Running,
+    Stopped,
+    Done,
+}
+
+impl Process {
+    pub fn new(pid: Pid) -> Self {
+        Process {
+            pid,
+            state: ProcessState::Running,
+        }
+    }
+
+    pub fn set_state(&mut self, state: ProcessState) {
+        self.state = state;
     }
 }
 
@@ -53,19 +103,20 @@ pub enum ProcessGroup {
     Background,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct JobManager {
     jobs: Vec<Job>,
     next_job_id: u64,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Job {
     id: u64,
     pgid: Pid,
     command: Command,
     mode: ProcessGroup,
-    state: Option<JobState>,
+    state: JobState,
+    processes: Vec<Process>,
 }
 
 impl Job {
@@ -75,8 +126,13 @@ impl Job {
             pgid: Pid::from_raw(0),
             command,
             mode,
-            state: None,
+            state: JobState::Running,
+            processes: Vec::new(),
         }
+    }
+
+    pub fn add_process(&mut self, process: Process) {
+        self.processes.push(process);
     }
 
     pub fn get_command(&self) -> &Command {
@@ -91,8 +147,24 @@ impl Job {
         &self.pgid
     }
 
-    pub fn set_state(&mut self, state: JobState) {
-        self.state = Some(state);
+    fn update_state(&mut self) {
+        if self.processes.iter().all(|p| p.state == ProcessState::Done) {
+            self.state = JobState::Done;
+        } else if self
+            .processes
+            .iter()
+            .all(|p| matches!(p.state, ProcessState::Done | ProcessState::Stopped))
+        {
+            self.state = JobState::Stopped;
+        } else {
+            self.state = JobState::Running;
+        }
+    }
+
+    fn set_process_state(&mut self, pid: Pid, state: ProcessState) {
+        if let Some(process) = self.processes.iter_mut().find(|p| p.pid == pid) {
+            process.set_state(state);
+        }
     }
 }
 
@@ -114,7 +186,7 @@ impl JobManager {
     pub fn add_job(&mut self, pgid: Pid, mut job: Job) {
         job.id = self.next_job_id;
         job.pgid = pgid;
-        job.state = Some(JobState::Running);
+        job.state = JobState::Running;
         println!("[{}] {}", job.id, pgid);
         self.jobs.push(job);
         self.next_job_id += 1;
@@ -122,42 +194,42 @@ impl JobManager {
 
     pub fn update_jobs(&mut self) -> Result<(), Error> {
         for job in self.jobs.iter_mut() {
-            let pgid = job.get_pgid();
+            let pgid = Pid::from_raw(-job.get_pgid().as_raw());
 
-            match waitpid(
-                Pid::from_raw(-pgid.as_raw()),
-                Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED),
-            ) {
-                Ok(WaitStatus::Exited(_, _)) | Ok(WaitStatus::Signaled(_, _, _)) => {
-                    job.set_state(JobState::Done);
-                }
+            loop {
+                match waitpid(
+                    pgid,
+                    Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED),
+                ) {
+                    Ok(WaitStatus::Exited(pid, _)) | Ok(WaitStatus::Signaled(pid, _, _)) => {
+                        job.set_process_state(pid, ProcessState::Done);
+                    }
 
-                Ok(WaitStatus::Stopped(_, _)) => {
-                    job.set_state(JobState::Stopped);
-                }
+                    Ok(WaitStatus::Stopped(pid, _)) => {
+                        job.set_process_state(pid, ProcessState::Stopped);
+                    }
 
-                Ok(WaitStatus::Continued(_)) => {
-                    job.set_state(JobState::Running);
-                }
+                    Ok(WaitStatus::Continued(pid)) => {
+                        job.set_process_state(pid, ProcessState::Running);
+                    }
 
-                Ok(WaitStatus::StillAlive) => {
-                    job.set_state(JobState::Running);
-                }
+                    Ok(WaitStatus::StillAlive) => break,
 
-                Ok(status) => {
-                    return Err(Error::UnhandledWaitStatus(status));
-                }
+                    Ok(status) => {
+                        return Err(Error::UnhandledWaitStatus(status));
+                    }
 
-                Err(Errno::ECHILD) => {
-                    // No remaining unwaited-for child in this process group.
-                    job.set_state(JobState::Done);
-                }
+                    Err(Errno::ECHILD) => break,
 
-                Err(err) => {
-                    return Err(Error::WaitPidFailed(err));
+                    Err(err) => {
+                        return Err(Error::WaitPidFailed(err));
+                    }
                 }
             }
+
+            job.update_state();
         }
+
         Ok(())
     }
 
@@ -171,7 +243,7 @@ impl JobManager {
 
     pub fn print_jobs(&mut self, done_only: bool) {
         for (index, job) in self.jobs.iter().enumerate() {
-            if done_only && job.state != Some(JobState::Done) {
+            if done_only && job.state != JobState::Done {
                 continue;
             }
             let marker = if index == self.jobs.len() - 1 {
@@ -182,7 +254,7 @@ impl JobManager {
                 ' '
             };
 
-            let state = job.state.as_ref().unwrap();
+            let state = &job.state;
 
             println!(
                 "[{}]{}  {:<24} {}",
@@ -193,6 +265,6 @@ impl JobManager {
             );
         }
 
-        self.jobs.retain(|job| job.state != Some(JobState::Done));
+        self.jobs.retain(|job| job.state != JobState::Done);
     }
 }

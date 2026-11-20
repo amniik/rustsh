@@ -1,18 +1,23 @@
-use crate::shell::command::{Command, Job, JobManager, ProcessGroup, StdStatus};
+use crate::shell::command::{
+    Command, Job, JobManager, Process, ProcessGroup, RuntimeStream, SimpleCommand, StdStream,
+};
 use libc::_exit;
 use nix::fcntl::OFlag;
 use nix::fcntl::open;
 use nix::sys::stat::Mode;
-use nix::unistd::{dup, dup2_stderr, dup2_stdout};
+use nix::unistd::close;
+use nix::unistd::{dup, dup2_stderr, dup2_stdin, dup2_stdout};
 use nix::{
     errno::Errno,
     sys::signal::{self, SigHandler, Signal},
-    sys::wait::{WaitPidFlag, waitpid},
-    unistd::{ForkResult, Pid, execv, fork, getpgrp, setpgid, tcsetpgrp},
+    sys::wait::{WaitPidFlag, WaitStatus, waitpid},
+    unistd::{ForkResult, Pid, execv, fork, getpgrp, pipe2, setpgid, tcsetpgrp},
 };
 use std::ffi::CString;
 use std::fmt;
 use std::io::{stderr, stdout};
+use std::os::fd::AsFd;
+use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::{env, os::unix::fs::PermissionsExt};
@@ -34,6 +39,9 @@ pub enum Error {
     SetPGFailed(nix::Error),
     SetTerminalPG(nix::Error),
     BuiltinNotFound(String),
+    PipeFailed(nix::Error),
+    UnhandledWaitStatus(WaitStatus),
+    Unreachable,
 }
 
 impl fmt::Display for Error {
@@ -62,8 +70,16 @@ impl fmt::Display for Error {
             Error::SetPGFailed(e) => write!(f, "set pg is failed: {e}"),
             Error::SetTerminalPG(e) => write!(f, "set terminal pg is failed: {e}"),
             Error::BuiltinNotFound(command) => write!(f, "{}: builtin command not found", command),
+            Error::PipeFailed(e) => write!(f, "pipe creation is failed: {e}"),
+            Error::UnhandledWaitStatus(status) => write!(f, "unhandled wait status: {status:?}"),
+            Error::Unreachable => write!(f, "unreachable code"),
         }
     }
+}
+
+struct PipelineResult {
+    pgid: Pid,
+    pids: Vec<Pid>,
 }
 
 pub struct Executer {
@@ -102,7 +118,20 @@ impl Executer {
     pub fn execute(&mut self, job: Job) -> Result<(), Error> {
         match job.get_mode() {
             ProcessGroup::Foreground if is_simple_builtin_command(job.get_command()) => {
-                self.execute_simple_builtin_command(job.get_command())
+                match job.get_command() {
+                    Command::Simple(SimpleCommand {
+                        args,
+                        serr,
+                        sin,
+                        sout,
+                    }) => self.execute_simple_builtin_command(
+                        args,
+                        &RuntimeStream::Configured(sout),
+                        &RuntimeStream::Configured(serr),
+                        &RuntimeStream::Configured(sin),
+                    ),
+                    _ => Err(Error::Unreachable),
+                }
             }
 
             ProcessGroup::Foreground => self.execute_foreground_job(job),
@@ -111,44 +140,138 @@ impl Executer {
         }
     }
 
-    fn execute_foreground_job(&self, job: Job) -> Result<(), Error> {
+    fn execute_foreground_job(&self, mut job: Job) -> Result<(), Error> {
         match job.get_command() {
-            Command::SimpleCommand {
+            Command::Simple(SimpleCommand {
                 args,
-                stdout,
-                stderr,
-            } => {
-                let pgid = self.execute_simple_command(args, stdout, stderr)?;
-
-                tcsetpgrp(&self.terminal_fd, pgid).map_err(Error::SetTerminalPG)?;
-
-                let wait_result =
-                    waitpid(Pid::from_raw(-pgid.as_raw()), Some(WaitPidFlag::WUNTRACED));
-
-                let restore_result =
-                    tcsetpgrp(&self.terminal_fd, self.shell_pgid).map_err(Error::SetTerminalPG);
-
-                wait_result.map_err(Error::WaitPidFailed)?;
-                restore_result?;
-
-                Ok(())
+                serr,
+                sin,
+                sout,
+            }) => {
+                let pgid = self.execute_simple_command(
+                    args,
+                    &RuntimeStream::Configured(sout),
+                    &RuntimeStream::Configured(serr),
+                    &RuntimeStream::Configured(sin),
+                    None,
+                    &[],
+                )?;
+                job.add_process(Process::new(pgid));
+                self.wait_foreground_job(pgid)
+            }
+            Command::Pipeline(commands) => {
+                let PipelineResult { pgid, pids }: PipelineResult =
+                    self.execute_pipeline(commands)?;
+                for pid in pids {
+                    job.add_process(Process::new(pid));
+                }
+                self.wait_foreground_job(pgid)
             }
         }
     }
 
-    fn execute_background_job(&mut self, job: Job) -> Result<(), Error> {
-        match job.get_command() {
-            Command::SimpleCommand {
-                args,
-                stdout,
-                stderr,
-            } => {
-                let pid = self.execute_simple_command(args, stdout, stderr)?;
-                self.job_manager.add_job(pid, job);
+    fn wait_for_job(&self, pgid: Pid) -> Result<(), Error> {
+        loop {
+            match waitpid(Pid::from_raw(-pgid.as_raw()), Some(WaitPidFlag::empty())) {
+                Ok(WaitStatus::Exited(_, _)) | Ok(WaitStatus::Signaled(_, _, _)) => {
+                    continue;
+                }
 
-                Ok(())
+                Err(Errno::ECHILD) => break Ok(()),
+
+                Ok(status) => break Err(Error::UnhandledWaitStatus(status)),
+
+                Err(err) => break Err(Error::WaitPidFailed(err)),
             }
         }
+    }
+
+    fn wait_foreground_job(&self, pgid: Pid) -> Result<(), Error> {
+        tcsetpgrp(&self.terminal_fd, pgid).map_err(Error::SetTerminalPG)?;
+
+        let wait_result = self.wait_for_job(pgid);
+
+        // Always attempt to restore terminal ownership.
+        let restore_result =
+            tcsetpgrp(&self.terminal_fd, self.shell_pgid).map_err(Error::SetTerminalPG);
+
+        wait_result?;
+        restore_result?;
+
+        Ok(())
+    }
+
+    fn execute_pipeline(&self, commands: &[SimpleCommand]) -> Result<PipelineResult, Error> {
+        if commands.is_empty() {
+            return Err(Error::Unreachable);
+        }
+
+        let mut pgid = None;
+        let mut pipes = Vec::new();
+        let mut pids = Vec::new();
+
+        for _ in 0..commands.len() - 1 {
+            pipes.push(pipe2(OFlag::O_CLOEXEC).map_err(Error::PipeFailed)?);
+        }
+
+        for (i, command) in commands.iter().enumerate() {
+            let sin = match command.sin {
+                StdStream::Terminal if i != 0 => RuntimeStream::Pipe(pipes[i - 1].0.as_fd()),
+                _ => RuntimeStream::Configured(&command.sin),
+            };
+
+            let sout = match command.sout {
+                StdStream::Terminal if i < commands.len() - 1 => {
+                    RuntimeStream::Pipe(pipes[i].1.as_fd())
+                }
+                _ => RuntimeStream::Configured(&command.sout),
+            };
+
+            let serr = RuntimeStream::Configured(&command.serr);
+
+            let id =
+                self.execute_simple_command(&command.args, &sout, &serr, &sin, pgid, &pipes)?;
+            pids.push(id);
+            if pgid.is_none() {
+                pgid = Some(id);
+            }
+        }
+
+        drop(pipes);
+
+        Ok(PipelineResult {
+            pgid: pgid.unwrap(),
+            pids,
+        })
+    }
+
+    fn execute_background_job(&mut self, mut job: Job) -> Result<(), Error> {
+        match job.get_command() {
+            Command::Simple(SimpleCommand {
+                args,
+                serr,
+                sin,
+                sout,
+            }) => {
+                let sout = RuntimeStream::Configured(sout);
+                let serr = RuntimeStream::Configured(serr);
+                let sin = RuntimeStream::Configured(sin);
+
+                let pgid = self.execute_simple_command(args, &sout, &serr, &sin, None, &[])?;
+                job.add_process(Process::new(pgid));
+
+                self.job_manager.add_job(pgid, job);
+            }
+            Command::Pipeline(commands) => {
+                let PipelineResult { pgid, pids } = self.execute_pipeline(commands)?;
+                for pid in pids {
+                    job.add_process(Process::new(pid));
+                }
+                self.job_manager.add_job(pgid, job);
+            }
+        }
+
+        Ok(())
     }
 
     fn run_builtin_command(&mut self, args: &[String]) -> Result<(), Error> {
@@ -164,22 +287,17 @@ impl Executer {
         }
     }
 
-    fn execute_simple_builtin_command(&mut self, command: &Command) -> Result<(), Error> {
-        let Command::SimpleCommand {
-            args,
-            stdout,
-            stderr,
-        } = command;
-        let mut terminal_stdout: Option<OwnedFd> = None;
-        let mut terminal_stderr: Option<OwnedFd> = None;
-        if let Some(std) = stdout {
-            terminal_stdout = Some(save_stdout()?);
-            redirect_stdout(std)?;
-        }
-        if let Some(std) = stderr {
-            terminal_stderr = Some(save_stderr()?);
-            redirect_stderr(std)?;
-        }
+    fn execute_simple_builtin_command(
+        &mut self,
+        args: &[String],
+        sout: &RuntimeStream,
+        serr: &RuntimeStream,
+        _: &RuntimeStream,
+    ) -> Result<(), Error> {
+        let terminal_stdout = Some(save_stdout()?);
+        redirect_stdout(sout)?;
+        let terminal_stderr = Some(save_stderr()?);
+        redirect_stderr(serr)?;
 
         let result = self.run_builtin_command(args);
 
@@ -197,8 +315,11 @@ impl Executer {
     fn execute_simple_command(
         &self,
         args: &[String],
-        stdout: &Option<StdStatus>,
-        stderr: &Option<StdStatus>,
+        sout: &RuntimeStream,
+        serr: &RuntimeStream,
+        sin: &RuntimeStream,
+        pgid: Option<Pid>,
+        pipes: &[(OwnedFd, OwnedFd)],
     ) -> Result<Pid, Error> {
         let Some(program) = args.first() else {
             return Err(Error::ArgsEmpty);
@@ -206,29 +327,48 @@ impl Executer {
 
         match unsafe { fork() } {
             Ok(ForkResult::Parent { child, .. }) => {
-                setpgid(child, child).map_err(Error::SetPGFailed)?;
-                Ok(child)
+                if let Some(pgid) = pgid {
+                    setpgid(child, pgid).map_err(Error::SetPGFailed)?;
+                    Ok(child)
+                } else {
+                    setpgid(child, child).map_err(Error::SetPGFailed)?;
+                    Ok(child)
+                }
             }
 
             Ok(ForkResult::Child) => {
                 restore_child_signals();
-                setpgid(Pid::from_raw(0), Pid::from_raw(0)).map_err(Error::SetPGFailed)?;
-                if let Some(std) = stdout
-                    && let Err(err) = redirect_stdout(std)
-                {
+                if let Some(pgid) = pgid {
+                    setpgid(Pid::from_raw(0), pgid).map_err(Error::SetPGFailed)?;
+                } else {
+                    setpgid(Pid::from_raw(0), Pid::from_raw(0)).map_err(Error::SetPGFailed)?;
+                }
+                if let Err(err) = redirect_stdout(sout) {
                     eprintln!("{program}: {err}");
                     unsafe {
                         _exit(1);
                     }
                 }
-                if let Some(std) = stderr
-                    && let Err(err) = redirect_stderr(std)
-                {
+                if let Err(err) = redirect_stderr(serr) {
                     eprintln!("{program}: {err}");
                     unsafe {
                         _exit(1);
                     }
                 }
+                if let Err(err) = redirect_stdin(sin) {
+                    eprintln!("{program}: {err}");
+                    unsafe {
+                        _exit(1);
+                    }
+                }
+
+                // Close all original pipe descriptors.
+                // stdin/stdout now refer to the duplicated descriptors.
+                for (read_fd, write_fd) in pipes {
+                    let _ = close(read_fd.as_raw_fd());
+                    let _ = close(write_fd.as_raw_fd());
+                }
+
                 let executable = if program.contains('/') {
                     find_executable(program)
                 } else {
@@ -340,16 +480,13 @@ impl Executer {
 
 fn is_simple_builtin_command(command: &Command) -> bool {
     match command {
-        Command::SimpleCommand {
-            args,
-            stdout: _,
-            stderr: _,
-        } => {
+        Command::Simple(SimpleCommand { args, .. }) => {
             let Some(program) = args.first() else {
                 return false;
             };
             is_builtin_commad(program.as_str())
         }
+        _ => false,
     }
 }
 
@@ -378,44 +515,75 @@ fn exec(path: &Path, args: &[String]) {
     }
 }
 
-fn redirect_stdout(std: &StdStatus) -> Result<(), Error> {
-    let StdStatus { path, append } = std;
-    let flag = if *append {
-        OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_CREAT | OFlag::O_APPEND
-    } else {
-        OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_CREAT | OFlag::O_TRUNC
-    };
-    let f = open(
-        path.as_str(),
-        flag,
-        Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IROTH,
-    )
-    .map_err(Error::StdoutRedirectionFailed)?;
-    dup2_stdout(f).map_err(Error::DupFailed)
+fn redirect_stdout(sout: &RuntimeStream) -> Result<(), Error> {
+    match sout {
+        RuntimeStream::Configured(StdStream::Terminal) => Ok(()),
+        RuntimeStream::Configured(StdStream::File { path, append }) => {
+            let flag = if *append {
+                OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_CREAT | OFlag::O_APPEND
+            } else {
+                OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_CREAT | OFlag::O_TRUNC
+            };
+            let f = open(
+                path.as_str(),
+                flag,
+                Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IROTH,
+            )
+            .map_err(Error::StdoutRedirectionFailed)?;
+            dup2_stdout(f).map_err(Error::DupFailed)
+        }
+        RuntimeStream::Pipe(fd) => dup2_stdout(fd).map_err(Error::DupFailed),
+    }
 }
 
 fn save_stdout() -> Result<OwnedFd, Error> {
     dup(stdout()).map_err(Error::DupFailed)
 }
 
-fn redirect_stderr(std: &StdStatus) -> Result<(), Error> {
-    let StdStatus { path, append } = std;
-    let flag = if *append {
-        OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_CREAT | OFlag::O_APPEND
-    } else {
-        OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_CREAT | OFlag::O_TRUNC
-    };
-    let f = open(
-        path.as_str(),
-        flag,
-        Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IROTH,
-    )
-    .map_err(Error::StderrRedirectionFailed)?;
-    dup2_stderr(f).map_err(Error::DupFailed)
+fn redirect_stderr(serr: &RuntimeStream) -> Result<(), Error> {
+    match serr {
+        RuntimeStream::Configured(StdStream::Terminal) => Ok(()),
+        RuntimeStream::Configured(StdStream::File { path, append }) => {
+            let flag = if *append {
+                OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_CREAT | OFlag::O_APPEND
+            } else {
+                OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_CREAT | OFlag::O_TRUNC
+            };
+            let f = open(
+                path.as_str(),
+                flag,
+                Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IROTH,
+            )
+            .map_err(Error::StderrRedirectionFailed)?;
+            dup2_stderr(f).map_err(Error::DupFailed)
+        }
+        RuntimeStream::Pipe(fd) => dup2_stderr(fd).map_err(Error::DupFailed),
+    }
 }
 
 fn save_stderr() -> Result<OwnedFd, Error> {
     dup(stderr()).map_err(Error::DupFailed)
+}
+
+fn redirect_stdin(sin: &RuntimeStream) -> Result<(), Error> {
+    match sin {
+        RuntimeStream::Configured(StdStream::Terminal) => Ok(()),
+        RuntimeStream::Configured(StdStream::File { path, append }) => {
+            let flag = if *append {
+                OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_CREAT | OFlag::O_APPEND
+            } else {
+                OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_CREAT | OFlag::O_TRUNC
+            };
+            let f = open(
+                path.as_str(),
+                flag,
+                Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IROTH,
+            )
+            .map_err(Error::StderrRedirectionFailed)?;
+            dup2_stdin(f).map_err(Error::DupFailed)
+        }
+        RuntimeStream::Pipe(fd) => dup2_stdin(fd).map_err(Error::DupFailed),
+    }
 }
 
 fn find_executable_in_path(name: &str) -> Option<PathBuf> {
