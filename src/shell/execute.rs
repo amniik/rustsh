@@ -724,7 +724,7 @@ fn restore_child_signals() {
         Signal::SIGTSTP,
         Signal::SIGTTIN,
         Signal::SIGTTOU,
-        Signal::SIGCHLD,
+        Signal::SIGPIPE,
     ] {
         unsafe {
             signal::signal(signal, SigHandler::SigDfl).unwrap();
