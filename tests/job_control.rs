@@ -67,3 +67,70 @@ fn background_pipeline_with_partially_stopped_process() {
         "expected pipeline to eventually become Done: {stdout}"
     );
 }
+
+#[test]
+fn background_resumes_stopped_job() {
+    let (stdout, stderr) = run_shell(
+        "sh -c 'kill -STOP $$; echo resumed' &\n\
+         sleep 1\n\
+         bg\n\
+         sleep 1\n\
+         exit\n",
+    );
+
+    assert!(stderr.is_empty(), "stderr: {stderr}");
+    assert!(
+        stdout.contains("resumed"),
+        "expected process to resume, stdout: {stdout}"
+    );
+}
+
+#[test]
+fn foreground_resumes_stopped_job() {
+    let (stdout, stderr) = run_shell(
+        "sh -c 'kill -STOP $$; echo resumed' &\n\
+         sleep 1\n\
+         fg\n\
+         echo after_fg\n\
+         exit\n",
+    );
+
+    assert!(stderr.is_empty(), "stderr: {stderr}");
+
+    assert!(
+        stdout.contains("resumed"),
+        "expected process to resume, stdout: {stdout}"
+    );
+
+    assert!(
+        stdout.contains("after_fg"),
+        "expected shell to continue after fg, stdout: {stdout}"
+    );
+}
+
+#[test]
+fn foreground_selects_job_by_id() {
+    let (stdout, stderr) = run_shell(
+        "sh -c 'kill -STOP $$; echo first' &\n\
+         sh -c 'kill -STOP $$; echo second' &\n\
+         sleep 1\n\
+         fg 1\n\
+         echo after_fg\n\
+         exit\n",
+    );
+
+    assert!(stderr.is_empty(), "stderr: {stderr}");
+
+    assert!(stdout.contains("first"));
+    assert!(stdout.contains("after_fg"));
+}
+
+#[test]
+fn foreground_invalid_job_id() {
+    let (_, stderr) = run_shell("fg 999\nexit\n");
+
+    assert!(
+        stderr.contains("fg: no jobs to bring to foreground"),
+        "unexpected stderr: {stderr}"
+    );
+}

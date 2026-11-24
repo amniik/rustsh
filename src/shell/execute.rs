@@ -1,5 +1,6 @@
 use crate::shell::command::{
-    Command, Job, JobManager, Process, ProcessGroup, RuntimeStream, SimpleCommand, StdStream,
+    Command, Job, JobManager, JobState, Process, ProcessGroup, ProcessState, RuntimeStream,
+    SimpleCommand, StdStream,
 };
 use libc::_exit;
 use nix::fcntl::OFlag;
@@ -9,7 +10,7 @@ use nix::unistd::close;
 use nix::unistd::{dup, dup2_stderr, dup2_stdin, dup2_stdout};
 use nix::{
     errno::Errno,
-    sys::signal::{self, SigHandler, Signal},
+    sys::signal::{self, SigHandler, Signal, killpg},
     sys::wait::{WaitPidFlag, WaitStatus, waitpid},
     unistd::{ForkResult, Pid, execv, fork, getpgrp, pipe2, setpgid, tcsetpgrp},
 };
@@ -35,12 +36,15 @@ pub enum Error {
     Exit,
     PwdFailed(std::io::Error),
     CdFailed(String),
+    FgFailed(String),
+    BgFailed(String),
     TerminalOpenFailed(nix::Error),
     SetPGFailed(nix::Error),
     SetTerminalPG(nix::Error),
     BuiltinNotFound(String),
     PipeFailed(nix::Error),
     UnhandledWaitStatus(WaitStatus),
+    SigKillFailed(nix::Error),
     Unreachable,
 }
 
@@ -66,12 +70,15 @@ impl fmt::Display for Error {
             Error::Exit => Ok(()),
             Error::PwdFailed(e) => write!(f, "pwd: {e}"),
             Error::CdFailed(s) => write!(f, "cd: {s}"),
+            Error::FgFailed(s) => write!(f, "fg: {s}"),
+            Error::BgFailed(s) => write!(f, "bg: {s}"),
             Error::TerminalOpenFailed(e) => write!(f, "opening terminal is faild: {e}"),
             Error::SetPGFailed(e) => write!(f, "set pg is failed: {e}"),
             Error::SetTerminalPG(e) => write!(f, "set terminal pg is failed: {e}"),
             Error::BuiltinNotFound(command) => write!(f, "{}: builtin command not found", command),
             Error::PipeFailed(e) => write!(f, "pipe creation is failed: {e}"),
             Error::UnhandledWaitStatus(status) => write!(f, "unhandled wait status: {status:?}"),
+            Error::SigKillFailed(e) => write!(f, "kill signal is failed: {e}"),
             Error::Unreachable => write!(f, "unreachable code"),
         }
     }
@@ -140,7 +147,7 @@ impl Executer {
         }
     }
 
-    fn execute_foreground_job(&self, mut job: Job) -> Result<(), Error> {
+    fn execute_foreground_job(&mut self, mut job: Job) -> Result<(), Error> {
         match job.get_command() {
             Command::Simple(SimpleCommand {
                 args,
@@ -157,7 +164,8 @@ impl Executer {
                     &[],
                 )?;
                 job.add_process(Process::new(pgid));
-                self.wait_foreground_job(pgid)
+                job.set_pgid(pgid);
+                self.wait_foreground_job(job)
             }
             Command::Pipeline(commands) => {
                 let PipelineResult { pgid, pids }: PipelineResult =
@@ -165,31 +173,59 @@ impl Executer {
                 for pid in pids {
                     job.add_process(Process::new(pid));
                 }
-                self.wait_foreground_job(pgid)
+                job.set_pgid(pgid);
+                self.wait_foreground_job(job)
             }
         }
     }
 
-    fn wait_for_job(&self, pgid: Pid) -> Result<(), Error> {
+    fn wait_for_job(&mut self, mut job: Job) -> Result<(), Error> {
+        let pgid = Pid::from_raw(-job.get_pgid().as_raw());
+
         loop {
-            match waitpid(Pid::from_raw(-pgid.as_raw()), Some(WaitPidFlag::empty())) {
-                Ok(WaitStatus::Exited(_, _)) | Ok(WaitStatus::Signaled(_, _, _)) => {
-                    continue;
+            match waitpid(pgid, Some(WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED)) {
+                Ok(WaitStatus::Exited(pid, _)) | Ok(WaitStatus::Signaled(pid, _, _)) => {
+                    job.set_process_state(pid, ProcessState::Done);
                 }
 
-                Err(Errno::ECHILD) => break Ok(()),
+                Ok(WaitStatus::Stopped(pid, _)) => {
+                    job.set_process_state(pid, ProcessState::Stopped);
+                }
 
-                Ok(status) => break Err(Error::UnhandledWaitStatus(status)),
+                Ok(WaitStatus::Continued(pid)) => {
+                    job.set_process_state(pid, ProcessState::Running);
+                }
 
-                Err(err) => break Err(Error::WaitPidFailed(err)),
+                Ok(WaitStatus::StillAlive) => break,
+
+                Ok(status) => {
+                    return Err(Error::UnhandledWaitStatus(status));
+                }
+
+                Err(Errno::EINTR) => continue,
+                Err(Errno::ECHILD) => break,
+                Err(err) => return Err(Error::WaitPidFailed(err)),
+            }
+
+            job.update_state();
+
+            if matches!(job.get_state(), JobState::Done | JobState::Stopped) {
+                break;
             }
         }
+
+        if job.get_state() == &JobState::Stopped {
+            self.job_manager.add_job(job);
+        }
+
+        Ok(())
     }
 
-    fn wait_foreground_job(&self, pgid: Pid) -> Result<(), Error> {
-        tcsetpgrp(&self.terminal_fd, pgid).map_err(Error::SetTerminalPG)?;
+    fn wait_foreground_job(&mut self, job: Job) -> Result<(), Error> {
+        let pgid = job.get_pgid();
+        tcsetpgrp(&self.terminal_fd, *pgid).map_err(Error::SetTerminalPG)?;
 
-        let wait_result = self.wait_for_job(pgid);
+        let wait_result = self.wait_for_job(job);
 
         // Always attempt to restore terminal ownership.
         let restore_result =
@@ -259,15 +295,16 @@ impl Executer {
 
                 let pgid = self.execute_simple_command(args, &sout, &serr, &sin, None, &[])?;
                 job.add_process(Process::new(pgid));
-
-                self.job_manager.add_job(pgid, job);
+                job.set_pgid(pgid);
+                self.job_manager.add_job(job);
             }
             Command::Pipeline(commands) => {
                 let PipelineResult { pgid, pids } = self.execute_pipeline(commands)?;
                 for pid in pids {
                     job.add_process(Process::new(pid));
                 }
-                self.job_manager.add_job(pgid, job);
+                job.set_pgid(pgid);
+                self.job_manager.add_job(job);
             }
         }
 
@@ -283,6 +320,8 @@ impl Executer {
             "cd" => self.cd(&args[1..]),
             "type" => self.type_cmd(&args[1..]),
             "jobs" => self.jobs(args),
+            "fg" => self.fg(&args[1..]),
+            "bg" => self.bg(&args[1..]),
             _ => Err(Error::BuiltinNotFound(program.to_string())),
         }
     }
@@ -468,6 +507,61 @@ impl Executer {
         Ok(())
     }
 
+    fn fg(&mut self, args: &[String]) -> Result<(), Error> {
+        let id = if args.len() > 1 {
+            return Err(Error::FgFailed(String::from("too many arguments")));
+        } else {
+            args.first()
+        };
+
+        let id: Option<u64> = id
+            .map(|id| {
+                id.parse::<u64>()
+                    .map_err(|_| Error::FgFailed("parameter is invalid".into()))
+            })
+            .transpose()?;
+
+        if let Some(mut job) = self.job_manager.take_job(id) {
+            killpg(Pid::from_raw(job.get_pgid().as_raw()), Signal::SIGCONT)
+                .map_err(Error::SigKillFailed)?;
+            job.set_stopped_processes_running();
+            println!("{}", job.get_command());
+            self.wait_foreground_job(job)?;
+            Ok(())
+        } else {
+            Err(Error::FgFailed(String::from(
+                "no jobs to bring to foreground",
+            )))
+        }
+    }
+
+    fn bg(&mut self, args: &[String]) -> Result<(), Error> {
+        let id = if args.len() > 1 {
+            return Err(Error::BgFailed(String::from("too many arguments")));
+        } else {
+            args.first()
+        };
+
+        let id: Option<u64> = id
+            .map(|id| {
+                id.parse::<u64>()
+                    .map_err(|_| Error::BgFailed("parameter is invalid".into()))
+            })
+            .transpose()?;
+
+        if let Some(job) = self.job_manager.get_mut_job(id) {
+            killpg(Pid::from_raw(job.get_pgid().as_raw()), Signal::SIGCONT)
+                .map_err(Error::SigKillFailed)?;
+            job.set_stopped_processes_running();
+            println!("[{}] {}", job.get_id(), job.get_command());
+            Ok(())
+        } else {
+            Err(Error::BgFailed(String::from(
+                "no jobs to bring to Background",
+            )))
+        }
+    }
+
     pub fn check_background_jobs(&mut self) {
         if let Err(err) = self.job_manager.update_jobs() {
             eprintln!("{err}");
@@ -491,7 +585,10 @@ fn is_simple_builtin_command(command: &Command) -> bool {
 }
 
 fn is_builtin_commad(command: &str) -> bool {
-    matches!(command, "echo" | "type" | "pwd" | "cd" | "jobs" | "exit")
+    matches!(
+        command,
+        "echo" | "type" | "pwd" | "cd" | "jobs" | "fg" | "bg" | "exit"
+    )
 }
 
 fn exec(path: &Path, args: &[String]) {
