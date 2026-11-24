@@ -143,7 +143,7 @@ fn test_builtin_stderr_restored_after_redirection() {
 
 #[test]
 fn test_background_job() {
-    let input = "sleep 2 >/dev/null 2>&1 &\n";
+    let input = "sleep 2 >/dev/null 2>/dev/null &\n";
     let start = std::time::Instant::now();
 
     let (stdout, stderr) = run_shell(input);

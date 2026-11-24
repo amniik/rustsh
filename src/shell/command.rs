@@ -92,6 +92,10 @@ impl Process {
         }
     }
 
+    pub fn get_state(&self) -> &ProcessState {
+        &self.state
+    }
+
     pub fn set_state(&mut self, state: ProcessState) {
         self.state = state;
     }
@@ -131,6 +135,10 @@ impl Job {
         }
     }
 
+    pub fn get_id(&self) -> u64 {
+        self.id
+    }
+
     pub fn add_process(&mut self, process: Process) {
         self.processes.push(process);
     }
@@ -147,7 +155,15 @@ impl Job {
         &self.pgid
     }
 
-    fn update_state(&mut self) {
+    pub fn get_state(&self) -> &JobState {
+        &self.state
+    }
+
+    pub fn set_pgid(&mut self, pgid: Pid) {
+        self.pgid = pgid;
+    }
+
+    pub fn update_state(&mut self) {
         if self.processes.iter().all(|p| p.state == ProcessState::Done) {
             self.state = JobState::Done;
         } else if self
@@ -161,10 +177,20 @@ impl Job {
         }
     }
 
-    fn set_process_state(&mut self, pid: Pid, state: ProcessState) {
+    pub fn set_process_state(&mut self, pid: Pid, state: ProcessState) {
         if let Some(process) = self.processes.iter_mut().find(|p| p.pid == pid) {
             process.set_state(state);
         }
+    }
+
+    pub fn set_stopped_processes_running(&mut self) {
+        for process in &mut self.processes {
+            if process.get_state() == &ProcessState::Stopped {
+                process.set_state(ProcessState::Running);
+            }
+        }
+
+        self.update_state();
     }
 }
 
@@ -183,13 +209,29 @@ impl JobManager {
         }
     }
 
-    pub fn add_job(&mut self, pgid: Pid, mut job: Job) {
+    pub fn add_job(&mut self, mut job: Job) {
         job.id = self.next_job_id;
-        job.pgid = pgid;
         job.state = JobState::Running;
-        println!("[{}] {}", job.id, pgid);
+        println!("[{}] {}", job.id, job.pgid);
         self.jobs.push(job);
         self.next_job_id += 1;
+    }
+
+    pub fn get_mut_job(&mut self, id: Option<u64>) -> Option<&mut Job> {
+        match id {
+            Some(id) => self.jobs.iter_mut().find(|job| job.get_id() == id),
+            None => self.jobs.last_mut(),
+        }
+    }
+
+    pub fn take_job(&mut self, id: Option<u64>) -> Option<Job> {
+        match id {
+            Some(id) => {
+                let index = self.jobs.iter().position(|job| job.get_id() == id)?;
+                Some(self.jobs.remove(index))
+            }
+            None => self.jobs.pop(),
+        }
     }
 
     pub fn update_jobs(&mut self) -> Result<(), Error> {
