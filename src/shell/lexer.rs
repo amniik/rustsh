@@ -39,6 +39,7 @@ pub enum Token {
     // use bool value as appending check
     RedirectStdout(bool),
     RedirectStderr(bool),
+    RedirectStdin,
     Ampersand,
     Pipe,
 }
@@ -104,6 +105,17 @@ impl Tokenizer {
                         Some(2) => tokens.push(Token::RedirectStderr(append)),
                         _ => tokens.push(Token::RedirectStdout(append)),
                     }
+                    token.clear();
+                    word_started = false;
+                }
+
+                (State::Normal, '<') => {
+                    if word_started {
+                        tokens.push(Token::Word(std::mem::take(&mut token)));
+                    }
+
+                    tokens.push(Token::RedirectStdin);
+
                     token.clear();
                     word_started = false;
                 }
