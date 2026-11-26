@@ -62,10 +62,7 @@ impl Tokenizer {
             match (&state, ch) {
                 (State::Normal, ' ' | '\t') => {
                     if word_started {
-                        match token.as_str() {
-                            "&" => tokens.push(Token::Ampersand),
-                            _ => tokens.push(Token::Word(std::mem::take(&mut token))),
-                        };
+                        tokens.push(Token::Word(std::mem::take(&mut token)));
                         word_started = false;
                     }
                 }
@@ -129,6 +126,15 @@ impl Tokenizer {
                     word_started = false;
                 }
 
+                (State::Normal, '&') => {
+                    if !token.is_empty() && word_started {
+                        tokens.push(Token::Word(std::mem::take(&mut token)));
+                    }
+                    tokens.push(Token::Ampersand);
+                    token.clear();
+                    word_started = false;
+                }
+
                 (State::NormalEscape, _) => {
                     token.push(ch);
                     state = State::Normal;
@@ -169,10 +175,7 @@ impl Tokenizer {
         }
 
         if word_started {
-            match token.as_str() {
-                "&" => tokens.push(Token::Ampersand),
-                _ => tokens.push(Token::Word(token)),
-            };
+            tokens.push(Token::Word(token));
         }
 
         Ok(tokens)
