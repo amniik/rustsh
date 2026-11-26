@@ -16,7 +16,7 @@ use nix::{
 };
 use std::ffi::CString;
 use std::fmt;
-use std::io::{stderr, stdout};
+use std::io::{stderr, stdin, stdout};
 use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
@@ -331,12 +331,14 @@ impl Executer {
         args: &[String],
         sout: &RuntimeStream,
         serr: &RuntimeStream,
-        _: &RuntimeStream,
+        sin: &RuntimeStream,
     ) -> Result<(), Error> {
         let terminal_stdout = Some(save_stdout()?);
         redirect_stdout(sout)?;
         let terminal_stderr = Some(save_stderr()?);
         redirect_stderr(serr)?;
+        let terminal_stdin = Some(save_stdin()?);
+        redirect_stdin(sin)?;
 
         let result = self.run_builtin_command(args);
 
@@ -347,6 +349,10 @@ impl Executer {
         if let Some(err) = terminal_stderr {
             // Restore the Stdout
             dup2_stderr(err).map_err(Error::DupFailed)?;
+        }
+        if let Some(i) = terminal_stdin {
+            // Restore the Stdout
+            dup2_stdin(i).map_err(Error::DupFailed)?;
         }
         result
     }
@@ -665,15 +671,10 @@ fn save_stderr() -> Result<OwnedFd, Error> {
 fn redirect_stdin(sin: &RuntimeStream) -> Result<(), Error> {
     match sin {
         RuntimeStream::Configured(StdStream::Terminal) => Ok(()),
-        RuntimeStream::Configured(StdStream::File { path, append }) => {
-            let flag = if *append {
-                OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_CREAT | OFlag::O_APPEND
-            } else {
-                OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_CREAT | OFlag::O_TRUNC
-            };
+        RuntimeStream::Configured(StdStream::File { path, .. }) => {
             let f = open(
                 path.as_str(),
-                flag,
+                OFlag::O_RDONLY | OFlag::O_CLOEXEC,
                 Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IROTH,
             )
             .map_err(Error::StderrRedirectionFailed)?;
@@ -681,6 +682,10 @@ fn redirect_stdin(sin: &RuntimeStream) -> Result<(), Error> {
         }
         RuntimeStream::Pipe(fd) => dup2_stdin(fd).map_err(Error::DupFailed),
     }
+}
+
+fn save_stdin() -> Result<OwnedFd, Error> {
+    dup(stdin()).map_err(Error::DupFailed)
 }
 
 fn find_executable_in_path(name: &str) -> Option<PathBuf> {

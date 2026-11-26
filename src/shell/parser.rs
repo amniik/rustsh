@@ -8,6 +8,7 @@ pub struct Parser;
 pub enum Error {
     StdoutNotFound,
     StderrNotFound,
+    StdinNotFound,
     TokensIsEmpty,
     InCompletePipe,
 }
@@ -17,6 +18,7 @@ impl fmt::Display for Error {
         match self {
             Error::StdoutNotFound => write!(f, "Stdout is not found for redirection"),
             Error::StderrNotFound => write!(f, "Stderr is not found for redirection"),
+            Error::StdinNotFound => write!(f, "stdin is not found for redirection"),
             Error::TokensIsEmpty => write!(f, "Tokens passed to parser is empty"),
             Error::InCompletePipe => write!(f, "pipe is incomplete"),
         }
@@ -35,6 +37,7 @@ impl Parser {
 
         let mut expecting_stderr = false;
         let mut expecting_stdout = false;
+        let mut expecting_stdin = false;
         let mut args: Vec<String> = Vec::new();
         let mut sout = StdStream::Terminal;
         let mut std_out_append = false;
@@ -66,6 +69,15 @@ impl Parser {
                     std_err_append = append;
                     expecting_stderr = true;
                 }
+                Token::RedirectStdin => {
+                    if expecting_stdout {
+                        return Err(Error::StdoutNotFound);
+                    }
+                    if expecting_stderr {
+                        return Err(Error::StderrNotFound);
+                    }
+                    expecting_stdin = true;
+                }
                 Token::Word(word) => {
                     if expecting_stdout {
                         sout = StdStream::File {
@@ -79,6 +91,12 @@ impl Parser {
                             append: std_err_append,
                         };
                         expecting_stderr = false;
+                    } else if expecting_stdin {
+                        sin = StdStream::File {
+                            path: word,
+                            append: false,
+                        };
+                        expecting_stdin = false;
                     } else {
                         args.push(word);
                     }
@@ -107,6 +125,8 @@ impl Parser {
             Err(Error::StdoutNotFound)
         } else if expecting_stderr {
             Err(Error::StderrNotFound)
+        } else if expecting_stdin {
+            Err(Error::StdinNotFound)
         } else {
             if is_pipeline && !args.is_empty() {
                 commands.push(SimpleCommand {
@@ -146,16 +166,26 @@ mod tests {
         expected_args: &[&str],
         expected_stdout: Option<(&str, bool)>,
         expected_stderr: Option<(&str, bool)>,
+        expected_stdin: Option<&str>,
     ) -> bool {
         let ProcessGroup::Foreground = job.get_mode() else {
             return false;
         };
 
         let Command::Simple(SimpleCommand {
-            args, sout, serr, ..
+            args,
+            sin,
+            sout,
+            serr,
         }) = job.get_command()
         else {
             return false;
+        };
+
+        let stdin_matches = match (sin, expected_stdin) {
+            (StdStream::Terminal, None) => true,
+            (StdStream::File { path, .. }, Some(expected_path)) => path == expected_path,
+            _ => false,
         };
 
         let stdout_matches = match (sout, expected_stdout) {
@@ -175,6 +205,7 @@ mod tests {
         };
 
         args.iter().map(String::as_str).collect::<Vec<_>>() == expected_args
+            && stdin_matches
             && stdout_matches
             && stderr_matches
     }
@@ -190,7 +221,13 @@ mod tests {
 
         let job = parse(tokens).unwrap();
 
-        assert!(is_foreground_simple_command(&job, &["pwd"], None, None,));
+        assert!(is_foreground_simple_command(
+            &job,
+            &["pwd"],
+            None,
+            None,
+            None
+        ));
     }
 
     #[test]
@@ -208,6 +245,7 @@ mod tests {
             &["echo", "hello", "world"],
             None,
             None,
+            None
         ));
     }
 
@@ -222,6 +260,7 @@ mod tests {
             &["echo", ""],
             None,
             None,
+            None
         ));
     }
 
@@ -241,6 +280,7 @@ mod tests {
             &["command", "first", "second", "third"],
             None,
             None,
+            None
         ));
     }
 
@@ -260,6 +300,7 @@ mod tests {
             &["echo", "hello"],
             Some(("out.txt", false)),
             None,
+            None
         ));
     }
 
@@ -291,6 +332,7 @@ mod tests {
             &["echo", "hello", "world"],
             Some(("out.txt", false)),
             None,
+            None
         ));
     }
 
@@ -310,6 +352,7 @@ mod tests {
             &["echo", "error"],
             None,
             Some(("error.txt", false)),
+            None
         ));
     }
 
@@ -338,6 +381,7 @@ mod tests {
             &["echo", "hello"],
             Some(("output.txt", false)),
             Some(("error.txt", false)),
+            None
         ));
     }
 
@@ -357,6 +401,7 @@ mod tests {
             &["echo", "hello"],
             Some(("out.txt", true)),
             None,
+            None
         ));
     }
 
@@ -376,6 +421,7 @@ mod tests {
             &["echo", "hello"],
             None,
             Some(("error.txt", true)),
+            None
         ));
     }
 
@@ -402,6 +448,74 @@ mod tests {
             result.get_command(),
             Command::Simple(SimpleCommand { args, .. })
                 if args == &["sleep", "10"]
+        ));
+    }
+
+    #[test]
+    fn parse_stdin_redirection() {
+        let tokens = vec![
+            Token::Word("cat".into()),
+            Token::RedirectStdin,
+            Token::Word("input.txt".into()),
+        ];
+
+        let job = parse(tokens).unwrap();
+
+        assert!(is_foreground_simple_command(
+            &job,
+            &["cat"],
+            None,
+            None,
+            Some("input.txt"),
+        ));
+    }
+
+    #[test]
+    fn parse_stdin_redirection_without_filename() {
+        let tokens = vec![Token::Word("cat".into()), Token::RedirectStdin];
+
+        assert!(matches!(parse(tokens), Err(Error::StdinNotFound)));
+    }
+
+    #[test]
+    fn parse_stdin_and_stdout_redirection() {
+        let tokens = vec![
+            Token::Word("cat".into()),
+            Token::RedirectStdin,
+            Token::Word("input.txt".into()),
+            Token::RedirectStdout(false),
+            Token::Word("output.txt".into()),
+        ];
+
+        let job = parse(tokens).unwrap();
+
+        assert!(is_foreground_simple_command(
+            &job,
+            &["cat"],
+            Some(("output.txt", false)),
+            None,
+            Some("input.txt"),
+        ));
+    }
+
+    #[test]
+    fn parse_stdin_redirection_with_arguments_after_target() {
+        let tokens = vec![
+            Token::Word("grep".into()),
+            Token::Word("hello".into()),
+            Token::RedirectStdin,
+            Token::Word("input.txt".into()),
+            Token::Word("world".into()),
+        ];
+
+        let job = parse(tokens).unwrap();
+
+        assert!(is_foreground_simple_command(
+            &job,
+            &["grep", "hello", "world"],
+            None,
+            None,
+            Some("input.txt"),
         ));
     }
 }
